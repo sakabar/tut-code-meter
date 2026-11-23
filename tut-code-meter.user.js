@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         tut-code-meter
 // @namespace    https://github.com/sakabar/tut-code-meter
-// @version      1.0.0
-// @description  表示中の本文のTUT-Codeカバー率を測り、未習得字を含む練習語をコピーします。
+// @version      1.1.0
+// @description  ページ本文全体や選択範囲のTUT-Codeカバー率を測り、未習得字を含む練習語をコピーします。
 // @license      MIT AND BSD-3-Clause
 // @match        https://*/*
 // @match        http://*/*
@@ -195,7 +195,7 @@ SUCH DAMAGE.
 
   // Accept whole text runs whenever possible. Subdivide only runs cut by a
   // viewport or overflow edge, preserving UTF-16 offsets for DOM Ranges.
-  function visibleSlices(node, clip, range) {
+  function visibleSlices(node, clip, range, start, end) {
     const slices = [];
     function scan(start, end) {
       range.setStart(node, start);
@@ -214,13 +214,15 @@ SUCH DAMAGE.
         scan(mid, end);
       }
     }
-    if (node.length) scan(0, node.length);
+    scan(start, end);
     return slices;
   }
 
-  function collect(selection, host) {
-    const viewport = { left: 0, top: 0, right: document.documentElement.clientWidth, bottom: innerHeight };
-    const measure = document.createRange();
+  function collect(selection, visibleOnly = false) {
+    const viewport = visibleOnly
+      ? { left: 0, top: 0, right: document.documentElement.clientWidth, bottom: innerHeight }
+      : null;
+    const measure = visibleOnly ? document.createRange() : null;
     const pieces = [];
     let boundary = true;
     const roots = [...document.body.querySelectorAll(mainSelector)].filter(el =>
@@ -236,14 +238,10 @@ SUCH DAMAGE.
       if (selection && !selection.intersectsNode(node)) return;
       if (node.nodeType === Node.TEXT_NODE) {
         if (!inBody || !node.length) return;
-        let slices;
-        if (selection) {
-          const start = node === selection.startContainer ? selection.startOffset : 0;
-          const end = node === selection.endContainer ? selection.endOffset : node.length;
-          slices = end > start ? [{ node, start, end }] : [];
-        } else {
-          slices = visibleSlices(node, clip, measure);
-        }
+        const start = node === selection?.startContainer ? selection.startOffset : 0;
+        const end = node === selection?.endContainer ? selection.endOffset : node.length;
+        if (end <= start) return;
+        const slices = clip ? visibleSlices(node, clip, measure, start, end) : [{ node, start, end }];
         for (const slice of slices) {
           pieces.push({ ...slice, boundary: boundary || slice.start > 0 });
           boundary = slice.end < node.length;
@@ -260,7 +258,7 @@ SUCH DAMAGE.
         || css.contentVisibility === 'hidden') return;
       const block = !['inline', 'contents', 'ruby', 'ruby-base'].includes(css.display);
       if (block) boundary = true;
-      if (!selection && block && node !== document.body && css.display !== 'contents') {
+      if (clip && block && node !== document.body) {
         const box = node.getBoundingClientRect();
         // A zero-height wrapper may still contain visible positioned children.
         if (box.height && box.width && !intersects(box, clip)) return;
@@ -278,7 +276,12 @@ SUCH DAMAGE.
           if (clip.left >= clip.right || clip.top >= clip.bottom) return;
         }
       }
-      for (let child = node.firstChild; child; child = child.nextSibling) visit(child, clip, inBody);
+      if (node.localName === 'details' && !node.open) {
+        const summary = node.querySelector(':scope > summary');
+        if (summary) visit(summary, clip, inBody);
+      } else {
+        for (let child = node.firstChild; child; child = child.nextSibling) visit(child, clip, inBody);
+      }
       if (block) boundary = true;
     }
     visit(document.body, viewport, !roots.length);
@@ -431,12 +434,20 @@ SUCH DAMAGE.
   let savedSelection = null;
   let interacting = false;
   let refreshTimer;
-  let lastText;
-  let lastResult;
+  let marksTimer;
+  let markedSelection = null;
+  let pageDirty = true;
+  let pageCache = {};
+  let selectionCache = {};
+  let renderedResult;
 
   function readSettings() {
     const values = GM_getValues();
-    learned = new Set([...target].filter(char => values['known:' + char] === true));
+    const nextLearned = [...target].filter(char => values['known:' + char] === true);
+    if (learned.size !== nextLearned.length || nextLearned.some(char => !learned.has(char))) {
+      learned = new Set(nextLearned);
+      pageCache.result = selectionCache.result = null;
+    }
     expanded = values.expanded === true;
     decorate.input.checked = values.decorate === true;
     includeOutside.input.checked = values.includeOutside === true;
@@ -446,7 +457,7 @@ SUCH DAMAGE.
       editBaseline = new Set(learned);
       editor.value = [...learned].join('');
     }
-    lastResult = null;
+    renderedResult = null;
     schedule(0);
   }
 
@@ -523,7 +534,7 @@ SUCH DAMAGE.
     toggle.textContent = '現在 ' + percentage(counts.learned, total);
     toggle.title = toggle.textContent + ' ｜ 全習得時 ' + percentage(inside, total);
     if (!expanded) return;
-    scope.textContent = selected ? '選択範囲' : '画面内の本文';
+    scope.textContent = selected ? '選択範囲' : 'ページ全体';
     const ratios = [[counts.learned, total], [inside, total], [counts.learned, inside]];
     ratios.forEach(([num, den], index) => {
       metricValues[index].textContent = `${percentage(num, den)}（${num}/${den}字）`;
@@ -561,24 +572,42 @@ SUCH DAMAGE.
     return range.commonAncestorContainer.getRootNode() === document ? range.cloneRange() : null;
   }
 
-  let lastSelected = false;
+  function textOf(pieces) {
+    return pieces.map(({ node, start, end, boundary }) =>
+      (boundary ? '\n' : '') + node.data.slice(start, end)).join('');
+  }
+
+  function cachedAnalysis(cache, text) {
+    if (!cache.result || cache.text !== text) {
+      cache.result = analyze(text, learned);
+      cache.text = text;
+    }
+    return cache.result;
+  }
+
+  function refreshMarks() {
+    clearTimeout(marksTimer);
+    if (active && document.body && decorate.input.checked) mark(collect(markedSelection, true), learned);
+    else clearMarks();
+  }
+
   function refresh() {
     if (!active || !document.body) return;
     const range = interacting ? savedSelection : pageSelection();
-    let pieces = [];
-    if (range && !range.collapsed && range.commonAncestorContainer.isConnected) pieces = collect(range, host);
-    const selected = pieces.length > 0;
-    if (!selected) pieces = collect(null, host);
-    const text = pieces.map(({ node, start, end, boundary }) =>
-      (boundary ? '\n' : '') + node.data.slice(start, end)).join('');
-    if (!lastResult || text !== lastText || selected !== lastSelected) {
-      lastResult = analyze(text, learned);
-      lastText = text;
-      lastSelected = selected;
-      render(lastResult, selected);
+    const selection = range && !range.collapsed && range.commonAncestorContainer.isConnected ? collect(range) : [];
+    markedSelection = selection.length ? range : null;
+    let result;
+    if (markedSelection) {
+      result = cachedAnalysis(selectionCache, textOf(selection));
+    } else {
+      result = cachedAnalysis(pageCache, pageDirty ? textOf(collect()) : pageCache.text);
+      pageDirty = false;
     }
-    if (decorate.input.checked) mark(pieces, learned);
-    else clearMarks();
+    if (result !== renderedResult) {
+      render(result, Boolean(markedSelection));
+      renderedResult = result;
+    }
+    refreshMarks();
     if (!host.isConnected) document.documentElement.append(host);
   }
   function schedule(delay = 120) {
@@ -609,16 +638,25 @@ SUCH DAMAGE.
     }
     schedule(0);
   });
-  document.addEventListener('scroll', () => schedule(), true);
-  window.addEventListener('resize', () => schedule());
-  window.addEventListener('load', () => schedule(0));
-  document.addEventListener('DOMContentLoaded', () => schedule(0));
-  document.fonts?.addEventListener('loadingdone', () => schedule());
+  document.addEventListener('scroll', () => {
+    if (!active || !decorate.input.checked) return;
+    clearTimeout(marksTimer);
+    marksTimer = setTimeout(refreshMarks, 120);
+  }, true);
+
+  function invalidatePage() {
+    pageDirty = true;
+    if (!refreshTimer) schedule();
+  }
+  window.addEventListener('resize', invalidatePage);
+  window.addEventListener('load', invalidatePage);
+  document.addEventListener('DOMContentLoaded', invalidatePage);
+  document.fonts?.addEventListener('loadingdone', invalidatePage);
 
   const observer = new MutationObserver(records => {
     // Coalesce a continuously changing page without postponing a pending read.
-    if (!refreshTimer && records.some(r => r.type !== 'childList' || r.removedNodes.length
-      || [...r.addedNodes].some(node => node !== host))) schedule();
+    if (records.some(r => r.type !== 'childList' || r.removedNodes.length
+      || [...r.addedNodes].some(node => node !== host))) invalidatePage();
   });
   function allowDisplay(allowed) {
     if (active === allowed) return;
@@ -631,12 +669,16 @@ SUCH DAMAGE.
       readSettings();
     } else {
       clearTimeout(refreshTimer);
+      clearTimeout(marksTimer);
       refreshTimer = undefined;
       observer.disconnect();
       host.remove();
       clearMarks();
       clipboardText = '';
-      lastText = lastResult = savedSelection = null;
+      pageDirty = true;
+      pageCache = {};
+      selectionCache = {};
+      renderedResult = markedSelection = savedSelection = null;
       interacting = false;
     }
   }

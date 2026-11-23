@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="ja">
+<meta charset="utf-8">
+<title>tut-code-meter 全文集計テスト</title>
+<style>#bottom { margin-top: 150vh; } body { padding-bottom: 100vh; }</style>
+<nav>集計対象外</nav>
+<main>
+  <p id="top">設計、設計、設計、設計、設計、構<b>築</b></p>
+  <p hidden>非表示</p>
+  <details><summary>…</summary>非表示</details>
+  <p id="bottom">構築、<span>構成</span>、語彙、語彙</p>
+</main>
+<output id="result">検証中</output>
+<script>
+  // Exercise the distributed userscript on a local file, with in-memory GM storage.
+  const values = { expanded: true, decorate: true };
+  for (const char of '設計築成語') values['known:' + char] = true;
+  let clipboard;
+  const GM_getValues = () => values;
+  const GM_addValueChangeListener = () => {};
+  const GM = {
+    getTab: async () => ({}), getTabs: async () => ({}),
+    setValue: async (key, value) => { values[key] = value; },
+    setValues: async changes => Object.assign(values, changes),
+    setClipboard: async text => { clipboard = text; },
+  };
+  let panel;
+  const attachShadow = Element.prototype.attachShadow;
+  Element.prototype.attachShadow = function (options) {
+    const root = attachShadow.call(this, options);
+    if (this.id === 'tut-code-meter') panel = root;
+    return root;
+  };
+  let analyses = 0;
+  const segment = Intl.Segmenter.prototype.segment;
+  Intl.Segmenter.prototype.segment = function (text) {
+    analyses++;
+    return segment.call(this, text);
+  };
+</script>
+<script src="../tut-code-meter.user.js"></script>
+<script>
+  const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+  async function until(description, predicate) {
+    const start = performance.now();
+    while (!predicate()) {
+      if (performance.now() - start > 4000) throw Error(description);
+      await delay(25);
+    }
+  }
+  const shown = (selector, value) => panel?.querySelector(selector)?.textContent === value;
+  const missing = () => CSS.highlights.get('tut-code-meter-missing')?.size;
+  function assert(condition, message) { if (!condition) throw Error(message); }
+  async function run() {
+    await until('初期表示と非表示要素の除外', () => shown('.scope', 'ページ全体') && shown('dd', '75%（15/20字）') && missing() === 1);
+    panel.querySelector('.copy').click();
+    assert(clipboard === '構築\n構成', '先頭での全文コピー');
+    const fullAnalyses = analyses;
+    document.querySelector('#bottom').scrollIntoView();
+    await until('スクロールで画面内の装飾を更新', () => missing() === 2);
+    assert(shown('dd', '75%（15/20字）'), '末尾でも全文の字数');
+    panel.querySelector('.copy').click();
+    assert(clipboard === '構築\n構成' && analyses === fullAnalyses, 'スクロール・コピーは全文結果を再利用');
+
+    const range = document.createRange();
+    range.selectNodeContents(document.querySelector('#bottom span'));
+    getSelection().addRange(range);
+    await until('選択した語だけを集計・装飾', () => shown('.scope', '選択範囲') && shown('dd', '50%（1/2字）') && missing() === 1);
+    panel.querySelector('.copy').click();
+    assert(clipboard === '構成', '選択範囲のコピー');
+    getSelection().removeAllRanges();
+    await until('選択解除で全文を復元', () => shown('.scope', 'ページ全体') && shown('dd', '75%（15/20字）'));
+    assert(analyses === fullAnalyses + 1, '選択解除は全文結果を再利用');
+
+    getSelection().addRange(range);
+    await until('段落の再選択', () => shown('.scope', '選択範囲'));
+    document.querySelector('#top').append('、構成、構成');
+    await delay(250);
+    assert(shown('dd', '50%（1/2字）'), '画面外の追記中も選択範囲を維持');
+    getSelection().removeAllRanges();
+    await until('追加された段落を一度だけ加算', () => shown('dd', '70.8%（17/24字）'));
+    panel.querySelector('.copy').click();
+    assert(clipboard === '構成\n構築', '追記後の全文の頻度順');
+  }
+  run().then(() => { document.querySelector('#result').textContent = 'PASS'; })
+    .catch(error => { document.querySelector('#result').textContent = 'FAIL: ' + error.message; });
+</script>
+</html>
