@@ -51,6 +51,67 @@
   const shown = (selector, value) => panel?.querySelector(selector)?.textContent === value;
   const missing = () => CSS.highlights.get('tut-code-meter-missing')?.size;
   function assert(condition, message) { if (!condition) throw Error(message); }
+  async function testForgotten() {
+    const settings = panel.querySelector('.save').closest('details');
+    const [known, forgetInput] = settings.querySelectorAll('textarea');
+    const save = settings.querySelector('.save');
+    const forget = settings.querySelector('.forget');
+    const feedback = forget.nextElementSibling;
+    const history = settings.querySelector('ul');
+    const articleChars = panel.querySelector('details');
+    const buttonFor = (list, char) => list.querySelector('button[data-char="' + char + '"]');
+    function edit(field, text) {
+      field.value = text;
+      field.dispatchEvent(new Event('input'));
+    }
+
+    edit(known, known.value + '構花');
+    save.click();
+    await until('習得済み字を準備', () => shown('dd', '90%（18/20字）') && !save.disabled);
+    edit(known, known.value + '森');
+    edit(forgetInput, ' 構構\n花 木彙');
+    forget.click();
+    await until('一括で忘れた字に移動', () => shown('dd', '75%（15/20字）') && history.children.length === 2);
+    assert(shown('dd:nth-of-type(2)', '90%（18/20字）') && shown('dd:nth-of-type(3)', '83.3%（15/18字）'), '忘れた字を対象内の未習得に数える');
+    for (const message of ['移した字（2字）：構花', '習得済みにない字：木', 'TUT-Code対象外：彙']) {
+      assert(feedback.textContent.includes(message), '混在入力の結果 ' + message);
+    }
+    assert(!known.value.includes('構') && !known.value.includes('花') && known.value.includes('森'), '習得済み欄から移動し、他の編集中の字を保持');
+    assert(buttonFor(history, '花') && !buttonFor(articleChars, '花'), '記事に現れない字も全件一覧に表示');
+    const group = buttonFor(articleChars, '構').closest('ul');
+    assert(group.previousElementSibling.textContent === '忘れた字' && group.textContent.includes('構　3回'), '忘れた字の出現回数');
+    panel.querySelector('.copy').click();
+    assert(clipboard === '構築\n構成', '忘れた字の練習語をコピー');
+
+    edit(forgetInput, '構');
+    forget.click();
+    await until('二重登録を防ぐ', () => feedback.textContent.includes('すでに忘れた字：構') && history.children.length === 2);
+    save.click();
+    await until('編集内容の保存で忘れた字が復活しない', () => values['known:森'] === true && !save.disabled);
+    assert(values['known:構'] === 'forgotten', '保存後も忘れた状態を保持');
+    const range = document.createRange();
+    range.selectNodeContents(document.querySelector('#bottom span'));
+    getSelection().addRange(range);
+    await until('選択範囲での忘れた字の頻度', () => shown('.scope', '選択範囲') && articleChars.textContent.includes('構　1回'));
+    getSelection().removeAllRanges();
+    await until('全文での忘れた字の頻度', () => articleChars.textContent.includes('構　3回'));
+
+    buttonFor(history, '花').click();
+    await until('全件一覧から再習得', () => history.children.length === 1 && known.value.includes('花'));
+    buttonFor(articleChars, '構').click();
+    await until('本文から再習得', () => shown('dd', '90%（18/20字）') && history.children.length === 0);
+    edit(forgetInput, '構');
+    forget.click();
+    await until('再度忘れた字に登録', () => shown('dd', '75%（15/20字）'));
+    edit(known, known.value + '構');
+    save.click();
+    await until('一括登録から再習得', () => shown('dd', '90%（18/20字）') && history.children.length === 0);
+    edit(known, known.value.replace('構', ''));
+    save.click();
+    await until('習得済み欄からの削除は通常の未習得', () => shown('dd', '75%（15/20字）') && values['known:構'] === false);
+    assert(history.children.length === 0 && buttonFor(articleChars, '構').closest('ul').previousElementSibling.textContent === '未習得字', '直接削除と忘れた字を区別');
+
+  }
   async function run() {
     await until('初期表示と非表示要素の除外', () => shown('.scope', 'ページ全体') && shown('dd', '75%（15/20字）') && missing() === 1);
     panel.querySelector('.copy').click();
@@ -72,6 +133,7 @@
     await until('選択解除で全文を復元', () => shown('.scope', 'ページ全体') && shown('dd', '75%（15/20字）'));
     assert(analyses === fullAnalyses + 1, '選択解除は全文結果を再利用');
 
+    await testForgotten();
     getSelection().addRange(range);
     await until('段落の再選択', () => shown('.scope', '選択範囲'));
     document.querySelector('#top').append('、構成、構成');

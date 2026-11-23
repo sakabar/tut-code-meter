@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         tut-code-meter
 // @namespace    https://github.com/sakabar/tut-code-meter
-// @version      1.1.0
+// @version      1.2.0
 // @description  ページ本文全体や選択範囲のTUT-Codeカバー率を測り、未習得字を含む練習語をコピーします。
 // @license      MIT AND BSD-3-Clause
 // @match        https://*/*
@@ -132,6 +132,18 @@ SUCH DAMAGE.
     return { learned, rejected };
   }
 
+  function classifyForgetInput(input, stored) {
+    const { learned: candidates, rejected } = parseLearned(input);
+    const result = { move: [], already: [], unlearned: [], outside: [...rejected] };
+    for (const char of candidates) {
+      const state = stored['known:' + char];
+      if (state === true) result.move.push(char);
+      else if (state === 'forgotten') result.already.push(char);
+      else result.unlearned.push(char);
+    }
+    return result;
+  }
+
   function analyze(text, learned) {
     const counts = { learned: 0, missing: 0, outside: 0 };
     const characters = new Map();
@@ -175,7 +187,7 @@ SUCH DAMAGE.
   }
 
   if (typeof document === 'undefined') {
-    module.exports = { target, parseLearned, analyze, percentage, practiceText, isMeeting };
+    module.exports = { target, parseLearned, classifyForgetInput, analyze, percentage, practiceText, isMeeting };
     return;
   }
 
@@ -373,7 +385,7 @@ SUCH DAMAGE.
     .option { display: flex; align-items: center; gap: 5px; margin: 6px 0; }
     .editor { display: block; margin: 8px 0 4px; }
     textarea { width: 100%; min-height: 55px; resize: vertical; display: block; }
-    .save { margin-top: 5px; }
+    .save, .forget { margin-top: 5px; }
     .status:not(:empty) { margin-top: 5px; font-size: 12px; }
     [hidden] { display: none !important; }
   `)];
@@ -392,7 +404,7 @@ SUCH DAMAGE.
   });
   const totals = el('div', '', 'meta');
   const wordList = el('ul');
-  const charList = el('ul');
+  const charList = el('div');
   const copy = el('button', '単語をコピー', 'copy');
   function option(label) {
     const wrapper = el('label', undefined, 'option');
@@ -416,7 +428,16 @@ SUCH DAMAGE.
   editLabel.append(editor);
   const save = el('button', '習得済み字を保存', 'save');
   const saveStatus = status();
-  settings.append(el('summary', '設定'), decorate.wrapper, editLabel, save, saveStatus);
+  const forgetLabel = el('label', '忘れた字', 'editor');
+  const forgetEditor = el('textarea');
+  forgetEditor.placeholder = '忘れた漢字をまとめて入力';
+  forgetLabel.append(forgetEditor);
+  const forget = el('button', '忘れた字に移す', 'forget');
+  const forgetStatus = status();
+  const forgottenCount = el('h2', '忘れた字の一覧（0字）');
+  const forgottenList = el('ul');
+  settings.append(el('summary', '設定'), decorate.wrapper, editLabel, save, saveStatus,
+    forgetLabel, forget, forgetStatus, forgottenCount, forgottenList);
   const chars = el('details');
   chars.append(el('summary', '打てない字と出現回数'), charList);
   panel.append(scope, metrics, totals, el('h2', '練習候補'), copy, includeOutside.wrapper,
@@ -425,6 +446,7 @@ SUCH DAMAGE.
   shadow.append(meter);
 
   let learned = new Set();
+  let forgotten = new Set();
   let editBaseline = new Set();
   let editDirty = false;
   let expanded = false;
@@ -443,10 +465,23 @@ SUCH DAMAGE.
 
   function readSettings() {
     const values = GM_getValues();
-    const nextLearned = [...target].filter(char => values['known:' + char] === true);
+    // Legacy true/false values retain their meanings. A character has one
+    // storage key so it cannot be both learned and forgotten.
+    const nextLearned = [];
+    const nextForgotten = [];
+    for (const char of target) {
+      const state = values['known:' + char];
+      if (state === true) nextLearned.push(char);
+      else if (state === 'forgotten') nextForgotten.push(char);
+    }
     if (learned.size !== nextLearned.length || nextLearned.some(char => !learned.has(char))) {
       learned = new Set(nextLearned);
       pageCache.result = selectionCache.result = null;
+    }
+    if (forgotten.size !== nextForgotten.length || nextForgotten.some(char => !forgotten.has(char))) {
+      forgotten = new Set(nextForgotten);
+      forgottenCount.textContent = `忘れた字の一覧（${forgotten.size}字）`;
+      forgottenList.replaceChildren(...nextForgotten.map(char => characterRow(char, 'forgotten')));
     }
     expanded = values.expanded === true;
     decorate.input.checked = values.decorate === true;
@@ -456,6 +491,13 @@ SUCH DAMAGE.
     if (!editDirty) {
       editBaseline = new Set(learned);
       editor.value = [...learned].join('');
+    } else {
+      // Keep unrelated draft edits when a saved character is forgotten here or in another tab.
+      const removed = new Set([...editBaseline].filter(char => forgotten.has(char)));
+      if (removed.size) {
+        editor.value = [...editor.value].filter(char => !removed.has(char)).join('');
+        for (const char of removed) editBaseline.delete(char);
+      }
     }
     renderedResult = null;
     schedule(0);
@@ -477,10 +519,9 @@ SUCH DAMAGE.
 
   editor.oninput = () => { editDirty = true; saveStatus.textContent = ''; };
   const nonce = () => Date.now() + '-' + Math.random();
-  async function writeLearned(changes) {
+  async function writeCharacterStates(changes) {
     if (Object.keys(changes).length) {
-      await GM.setValues(changes);
-      await GM.setValue('learnedRevision', nonce());
+      await GM.setValues({ ...changes, learnedRevision: nonce() });
     }
     readSettings();
   }
@@ -489,11 +530,15 @@ SUCH DAMAGE.
     // Store the edits relative to what the user saw. Concurrent edits to
     // other characters in another tab survive a bulk save.
     const changes = {};
-    for (const char of editBaseline) if (!parsed.learned.has(char)) changes['known:' + char] = false;
+    const stored = GM_getValues();
+    for (const char of editBaseline) {
+      const key = 'known:' + char;
+      if (!parsed.learned.has(char) && stored[key] === true) changes[key] = false;
+    }
     for (const char of parsed.learned) if (!editBaseline.has(char)) changes['known:' + char] = true;
     save.disabled = editor.disabled = true;
     try {
-      await writeLearned(changes);
+      await writeCharacterStates(changes);
       editDirty = false;
       readSettings();
       saveStatus.textContent = `${learned.size}字を登録しました。` +
@@ -504,17 +549,42 @@ SUCH DAMAGE.
       save.disabled = editor.disabled = false;
     }
   };
-  charList.onclick = async event => {
-    const button = event.target.closest('button[data-char]');
-    if (!button) return;
-    button.disabled = true;
+  forgetEditor.oninput = () => { forgetStatus.textContent = ''; };
+  forget.onclick = async () => {
+    if (!forgetEditor.value.trim()) {
+      forgetStatus.textContent = '移す字を入力してください。';
+      return;
+    }
+    const { move, already, unlearned, outside } = classifyForgetInput(forgetEditor.value, GM_getValues());
+    forget.disabled = forgetEditor.disabled = true;
     try {
-      await writeLearned({ ['known:' + button.dataset.char]: true });
+      await writeCharacterStates(Object.fromEntries(move.map(char => ['known:' + char, 'forgotten'])));
+      const messages = [move.length ? `移した字（${move.length}字）：${move.join('')}` : '移した字はありません。'];
+      if (already.length) messages.push('すでに忘れた字：' + already.join(''));
+      if (unlearned.length) messages.push('習得済みにない字：' + unlearned.join(''));
+      if (outside.length) messages.push('TUT-Code対象外：' + outside.join(''));
+      forgetStatus.textContent = messages.join('　');
+      if (move.length) forgetEditor.value = '';
     } catch {
-      button.disabled = false;
-      copyStatus.textContent = '登録できませんでした。もう一度お試しください。';
+      forgetStatus.textContent = '保存できませんでした。もう一度お試しください。';
+    } finally {
+      forget.disabled = forgetEditor.disabled = false;
     }
   };
+  panel.addEventListener('click', async event => {
+    const button = event.target.closest('button[data-char]');
+    if (!button) return;
+    const feedback = forgottenList.contains(button) ? forgetStatus : copyStatus;
+    const char = button.dataset.char;
+    button.disabled = true;
+    try {
+      await writeCharacterStates({ ['known:' + char]: true });
+      if (feedback === forgetStatus) feedback.textContent = char + 'を習得済みに戻しました。';
+    } catch {
+      button.disabled = false;
+      feedback.textContent = '登録できませんでした。もう一度お試しください。';
+    }
+  });
   copy.onclick = async () => {
     if (!active) return;
     refresh();
@@ -526,6 +596,19 @@ SUCH DAMAGE.
       copyStatus.textContent = 'コピーできませんでした。もう一度お試しください。';
     }
   };
+
+  function characterRow(char, kind, count) {
+    const row = el('li');
+    row.append(el('span', count === undefined ? char : `${char}　${count}回`));
+    if (kind !== 'outside') {
+      const restoring = kind === 'forgotten';
+      const button = el('button', restoring ? '習得済みに戻す' : '習得済みにする');
+      button.dataset.char = char;
+      button.setAttribute('aria-label', char + 'を' + button.textContent);
+      row.append(button);
+    }
+    return row;
+  }
 
   function render(result, selected) {
     const { counts, words, characters } = result;
@@ -551,18 +634,15 @@ SUCH DAMAGE.
       return row;
     }));
     if (!words.length) wordList.append(el('li', '練習候補はありません。'));
-    charList.replaceChildren(...characters.map(({ char, kind, count }) => {
-      const row = el('li');
-      row.append(el('span', `${char}　${count}回`));
-      if (kind === 'outside') row.append(el('span', '外字', 'note'));
-      else {
-        const button = el('button', '習得済みにする');
-        button.dataset.char = char;
-        button.setAttribute('aria-label', char + 'を習得済みにする');
-        row.append(button);
-      }
-      return row;
-    }));
+    const groups = { forgotten: el('ul'), missing: el('ul'), outside: el('ul') };
+    for (const { char, kind, count } of characters) {
+      const group = forgotten.has(char) ? 'forgotten' : kind;
+      groups[group].append(characterRow(char, group, count));
+    }
+    charList.replaceChildren();
+    for (const [kind, label] of [['forgotten', '忘れた字'], ['missing', '未習得字'], ['outside', '外字']]) {
+      if (groups[kind].childElementCount) charList.append(el('h2', label), groups[kind]);
+    }
   }
 
   function pageSelection() {

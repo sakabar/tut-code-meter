@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { target, parseLearned, analyze, percentage, practiceText, isMeeting } = require('../tut-code-meter.user.js');
+const { target, parseLearned, classifyForgetInput, analyze, percentage, practiceText, isMeeting } = require('../tut-code-meter.user.js');
 
 const article = '設計、設計、設計、設計、設計、構築、構築、構成、語彙、語彙';
 
@@ -48,6 +48,14 @@ test('習得済み字の一括登録では空白と重複を除き、対象外�
   const { learned, rejected } = parseLearned(' 設設\n計　彙あ彙');
   assert.deepEqual([...learned], ['設', '計']);
   assert.deepEqual([...rejected], ['彙', 'あ']);
+});
+
+test('忘れた字への移動は現在の習得済み字だけを重複なく受け付ける', () => {
+  const stored = { 'known:構': true, 'known:設': true, 'known:語': 'forgotten', 'known:築': false };
+  assert.deepEqual(classifyForgetInput(' 構築\n語構　設計彙あ彙', stored), {
+    move: ['構', '設'], already: ['語'], unlearned: ['築', '計'], outside: ['彙', 'あ'],
+  });
+  assert.deepEqual(classifyForgetInput('　\n', stored), { move: [], already: [], unlearned: [], outside: [] });
 });
 
 test('MeetはHTTPSの標準会議パスに限定する', () => {
