@@ -112,6 +112,74 @@
     assert(history.children.length === 0 && buttonFor(articleChars, '構').closest('ul').previousElementSibling.textContent === '未習得字', '直接削除と忘れた字を区別');
 
   }
+  async function testRegistrationScroll() {
+    const letters = '一二三四五六七八九十上下左右大小天地山川田水火木金土月日年白黒赤青';
+    const chars = panel.querySelector('details');
+    const settings = panel.querySelector('.save').closest('details');
+    const words = panel.querySelector('.copy').parentElement.querySelector('ul');
+    const top = document.querySelector('#top');
+    top.textContent = [...letters].join('、');
+    document.querySelector('#bottom').textContent = '';
+    chars.open = true;
+    settings.open = true;
+    await until('長い一覧を準備', () => chars.querySelectorAll('button').length === letters.length);
+    window.scrollTo(0, 180);
+
+    function aim(button) {
+      button.scrollIntoView({ block: 'center' });
+      const box = button.getBoundingClientRect();
+      return [box.left + box.width / 2, box.top + box.height / 2];
+    }
+    async function clickAt(point, button) {
+      const hit = panel.elementFromPoint(...point);
+      assert(hit === button, '同じ位置で次の「' + button.dataset.char + '」を押せる');
+      const pageY = window.scrollY;
+      hit.click();
+      await until('押した行を取り除く', () => !button.isConnected);
+      await new Promise(requestAnimationFrame);
+      assert(window.scrollY === pageY, '記事本文のスクロール位置を保持');
+    }
+    async function clickThree(list, index) {
+      const buttons = [...list.querySelectorAll('button')];
+      const point = aim(buttons[index]);
+      for (const button of buttons.slice(index, index + 3)) await clickAt(point, button);
+      assert(list.contains(buttons[index + 3]), '続きの行と一覧を再利用');
+    }
+
+    const list = chars.querySelector('button').closest('ul');
+    await clickThree(list, 15);
+    await clickThree(list, 0);
+    const tail = list.lastElementChild;
+    const previous = tail.previousElementSibling;
+    const lastButton = tail.querySelector('button');
+    await clickAt(aim(lastButton), lastButton);
+    const lastBox = previous.querySelector('button').getBoundingClientRect();
+    assert(panel.elementFromPoint(lastBox.x + lastBox.width / 2, lastBox.y + lastBox.height / 2) === previous.querySelector('button'), '末尾に残った最後の字が見える');
+    assert(shown('dd', percentageFor(7, letters.length)) && words.children.length === letters.length - 7, '連続登録後のカバー率と練習候補');
+
+    top.textContent = '春、夏、秋、冬';
+    await until('短い練習候補を準備', () => words.children.length === 4 && chars.querySelectorAll('button').length === 4);
+    const wordHeight = words.getBoundingClientRect().height;
+    await clickThree(chars.querySelector('button').closest('ul'), 0);
+    assert(words.getBoundingClientRect().height < wordHeight, '練習候補の高さが縮む');
+    const only = chars.querySelector('button');
+    await clickAt(aim(only), only);
+    assert(!chars.querySelector('button') && shown('dd', '100%（4/4字）') && panel.querySelector('.copy').disabled, 'グループの最後の1字で集計とコピー対象を更新');
+
+    const [known, forget] = settings.querySelectorAll('textarea');
+    known.value = letters;
+    known.dispatchEvent(new Event('input'));
+    settings.querySelector('.save').click();
+    await until('習得済みの保存', () => !settings.querySelector('.save').disabled);
+    forget.value = letters;
+    settings.querySelector('.forget').click();
+    const history = settings.querySelector('ul');
+    await until('長い忘れた字一覧を準備', () => history.children.length === letters.length);
+    await clickThree(history, 15);
+  }
+  function percentageFor(count, total) {
+    return Number((100 * count / total).toFixed(1)) + '%（' + count + '/' + total + '字）';
+  }
   async function run() {
     await until('初期表示と非表示要素の除外', () => shown('.scope', 'ページ全体') && shown('dd', '75%（15/20字）') && missing() === 1);
     panel.querySelector('.copy').click();
@@ -143,6 +211,7 @@
     await until('追加された段落を一度だけ加算', () => shown('dd', '70.8%（17/24字）'));
     panel.querySelector('.copy').click();
     assert(clipboard === '構成\n構築', '追記後の全文の頻度順');
+    await testRegistrationScroll();
   }
   run().then(() => { document.querySelector('#result').textContent = 'PASS'; })
     .catch(error => { document.querySelector('#result').textContent = 'FAIL: ' + error.message; });

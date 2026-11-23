@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         tut-code-meter
 // @namespace    https://github.com/sakabar/tut-code-meter
-// @version      1.2.0
+// @version      1.2.1
 // @description  ページ本文全体や選択範囲のTUT-Codeカバー率を測り、未習得字を含む練習語をコピーします。
 // @license      MIT AND BSD-3-Clause
 // @match        https://*/*
@@ -405,6 +405,13 @@ SUCH DAMAGE.
   const totals = el('div', '', 'meta');
   const wordList = el('ul');
   const charList = el('div');
+  const charGroups = {};
+  for (const [kind, label] of [['forgotten', '忘れた字'], ['missing', '未習得字'], ['outside', '外字']]) {
+    const heading = el('h2', label);
+    const list = el('ul');
+    charList.append(heading, list);
+    charGroups[kind] = list;
+  }
   const copy = el('button', '単語をコピー', 'copy');
   function option(label) {
     const wrapper = el('label', undefined, 'option');
@@ -481,7 +488,7 @@ SUCH DAMAGE.
     if (forgotten.size !== nextForgotten.length || nextForgotten.some(char => !forgotten.has(char))) {
       forgotten = new Set(nextForgotten);
       forgottenCount.textContent = `忘れた字の一覧（${forgotten.size}字）`;
-      forgottenList.replaceChildren(...nextForgotten.map(char => characterRow(char, 'forgotten')));
+      updateCharacterRows(forgottenList, 'forgotten', new Map(nextForgotten.map(char => [char, undefined])));
     }
     expanded = values.expanded === true;
     decorate.input.checked = values.decorate === true;
@@ -571,18 +578,45 @@ SUCH DAMAGE.
       forget.disabled = forgetEditor.disabled = false;
     }
   };
+  // Only the latest click may adjust the panel after an asynchronous save.
+  let pendingPosition = null;
+  function cancelPosition() { pendingPosition = null; }
+  panel.addEventListener('wheel', cancelPosition, { passive: true });
+  document.addEventListener('keydown', cancelPosition, true);
+  document.addEventListener('pointerdown', cancelPosition, true);
+
   panel.addEventListener('click', async event => {
     const button = event.target.closest('button[data-char]');
     if (!button) return;
     const feedback = forgottenList.contains(button) ? forgetStatus : copyStatus;
     const char = button.dataset.char;
+    const row = button.closest('li');
+    const list = row.parentElement;
+    const next = (row.nextElementSibling || row.previousElementSibling)?.querySelector('button');
+    const position = next && button.getBoundingClientRect().height
+      ? { listTop: list.getBoundingClientRect().top, top: button.getBoundingClientRect().top } : null;
+    pendingPosition = position;
     button.disabled = true;
     try {
       await writeCharacterStates({ ['known:' + char]: true });
       if (feedback === forgetStatus) feedback.textContent = char + 'を習得済みに戻しました。';
+      if (position && position === pendingPosition && active && expanded) {
+        // Include the resized word list and save feedback in the final layout.
+        refresh();
+        if (next.isConnected && next.getBoundingClientRect().height) {
+          panel.scrollTop += list.getBoundingClientRect().top - position.listTop;
+          const listBox = list.getBoundingClientRect();
+          const nextBox = next.getBoundingClientRect();
+          const topInList = Math.max(listBox.top, Math.min(position.top, listBox.bottom - nextBox.height));
+          list.scrollTop += nextBox.top - topInList;
+          panel.scrollTop += next.getBoundingClientRect().top - position.top;
+        }
+      }
     } catch {
-      button.disabled = false;
       feedback.textContent = '登録できませんでした。もう一度お試しください。';
+    } finally {
+      button.disabled = false;
+      if (pendingPosition === position) cancelPosition();
     }
   });
   copy.onclick = async () => {
@@ -597,9 +631,10 @@ SUCH DAMAGE.
     }
   };
 
-  function characterRow(char, kind, count) {
+  function characterRow(char, kind) {
     const row = el('li');
-    row.append(el('span', count === undefined ? char : `${char}　${count}回`));
+    row.dataset.char = char;
+    row.append(el('span'));
     if (kind !== 'outside') {
       const restoring = kind === 'forgotten';
       const button = el('button', restoring ? '習得済みに戻す' : '習得済みにする');
@@ -608,6 +643,23 @@ SUCH DAMAGE.
       row.append(button);
     }
     return row;
+  }
+
+  function updateCharacterRows(list, kind, counts) {
+    const rows = new Map();
+    for (const row of [...list.children]) {
+      const char = row.dataset.char;
+      if (counts.has(char)) rows.set(char, row);
+      else row.remove();
+    }
+    let next = list.firstElementChild;
+    for (const [char, count] of counts) {
+      const row = rows.get(char) || characterRow(char, kind);
+      const label = count === undefined ? char : `${char}　${count}回`;
+      if (row.firstElementChild.textContent !== label) row.firstElementChild.textContent = label;
+      if (row !== next) list.insertBefore(row, next);
+      next = row.nextElementSibling;
+    }
   }
 
   function render(result, selected) {
@@ -634,14 +686,14 @@ SUCH DAMAGE.
       return row;
     }));
     if (!words.length) wordList.append(el('li', '練習候補はありません。'));
-    const groups = { forgotten: el('ul'), missing: el('ul'), outside: el('ul') };
+    const groups = { forgotten: new Map(), missing: new Map(), outside: new Map() };
     for (const { char, kind, count } of characters) {
-      const group = forgotten.has(char) ? 'forgotten' : kind;
-      groups[group].append(characterRow(char, group, count));
+      groups[forgotten.has(char) ? 'forgotten' : kind].set(char, count);
     }
-    charList.replaceChildren();
-    for (const [kind, label] of [['forgotten', '忘れた字'], ['missing', '未習得字'], ['outside', '外字']]) {
-      if (groups[kind].childElementCount) charList.append(el('h2', label), groups[kind]);
+    for (const [kind, counts] of Object.entries(groups)) {
+      const list = charGroups[kind];
+      updateCharacterRows(list, kind, counts);
+      list.previousElementSibling.hidden = list.hidden = !counts.size;
     }
   }
 
@@ -672,6 +724,8 @@ SUCH DAMAGE.
   }
 
   function refresh() {
+    clearTimeout(refreshTimer);
+    refreshTimer = undefined;
     if (!active || !document.body) return;
     const range = interacting ? savedSelection : pageSelection();
     const selection = range && !range.collapsed && range.commonAncestorContainer.isConnected ? collect(range) : [];
@@ -692,10 +746,7 @@ SUCH DAMAGE.
   }
   function schedule(delay = 120) {
     clearTimeout(refreshTimer);
-    if (active) refreshTimer = setTimeout(() => {
-      refreshTimer = undefined;
-      refresh();
-    }, delay);
+    if (active) refreshTimer = setTimeout(refresh, delay);
   }
 
   // Keep the article selection while the user moves focus into the panel.
@@ -748,6 +799,7 @@ SUCH DAMAGE.
       });
       readSettings();
     } else {
+      cancelPosition();
       clearTimeout(refreshTimer);
       clearTimeout(marksTimer);
       refreshTimer = undefined;
