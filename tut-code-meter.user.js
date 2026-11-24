@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         tut-code-meter
 // @namespace    https://github.com/sakabar/tut-code-meter
-// @version      2.2.6
+// @version      2.2.7
 // @description  許可したページのTUT-Codeカバー率と未知語を端末内に記録し、あとから振り返ります。
 // @license      MIT AND BSD-3-Clause
 // @match        https://*/*
@@ -876,7 +876,7 @@ SUCH DAMAGE.
             wordCopyButton(() => practiceText(record.words, true), true),
             button('この記事の記録を削除', () => confirmDelete({ day: record.day, url: record.url }, 'この記事の' + record.day + 'の記録を削除しますか？')),
             button('このサイトの記録を削除', () => confirmDelete({ host: record.host }, record.host + ' の全期間の記録を削除しますか？')));
-          detail.append(summary, el('pre', recordText(record)), tools, learningList([record]));
+          detail.append(summary, tools, learningList([record]), el('pre', recordText(record)));
           article.append(detail);
           results.append(article);
         }
