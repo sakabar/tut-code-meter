@@ -1,219 +1,347 @@
 <!doctype html>
 <html lang="ja">
 <meta charset="utf-8">
-<title>tut-code-meter 全文集計テスト</title>
-<style>#bottom { margin-top: 150vh; } body { padding-bottom: 100vh; }</style>
-<nav>集計対象外</nav>
+<title>学習履歴の検算記事</title>
+<meta property="og:site_name" content="検算サイト">
+<nav>対象外の案内</nav>
 <main>
-  <p id="top">設計、設計、設計、設計、設計、構<b>築</b></p>
-  <p hidden>非表示</p>
-  <details><summary>…</summary>非表示</details>
-  <p id="bottom">構築、<span>構成</span>、語彙、語彙</p>
+  <p>設計、設計、設計、設計、設計、構<b>築</b></p><p hidden>非表示</p>
+  <details><summary>…</summary>非表示</details><input value="入力欄">
+  <p style="margin-top:150vh">構築、構成、語彙、語彙</p>
 </main>
 <output id="result">検証中</output>
 <script>
-  // Exercise the distributed userscript on a local file, with in-memory GM storage.
-  const values = { expanded: true, decorate: true };
-  for (const char of '設計築成語') values['known:' + char] = true;
-  let clipboard;
-  const GM_getValues = () => values;
-  const GM_addValueChangeListener = () => {};
+  // The same file is also a second browsing context with shared script storage.
+  const child = window !== top;
+  const isPrivate = child && frameElement.hasAttribute('data-private');
+  const store = child ? parent.store : new Map();
+  window.store = store;
+  const listeners = child ? parent.listeners : new Map();
+  window.listeners = listeners;
+  const menus = new Map();
+  window.menuCount = () => menus.size;
+  const GM_info = { isIncognito: isPrivate };
+  const GM_registerMenuCommand = (name, callback) => menus.set(name, callback);
+  const GM_addValueChangeListener = (key, fn) => listeners.set(key, [...listeners.get(key) || [], fn]);
+  const GM_getValues = keys => Object.fromEntries(keys.filter(k => store.has(k)).map(k => [k, structuredClone(store.get(k))]));
+  let tab = {}, meeting = false, clipboard = '', foreground = !child;
   const GM = {
-    getTab: async () => ({}), getTabs: async () => ({}),
-    setValue: async (key, value) => { values[key] = value; },
-    setValues: async changes => Object.assign(values, changes),
-    setClipboard: async text => { clipboard = text; },
+    getTab: async () => structuredClone(tab), saveTab: async next => { tab = structuredClone(next); },
+    getTabs: async () => ({ 1: { tutCodeMeeting: meeting } }),
+    getValues: async keys => GM_getValues(keys), listValues: async () => [...store.keys()],
+    async setValue(k, v) { store.set(k, structuredClone(v)); for (const fn of listeners.get(k) || []) fn(); },
+    async setValues(changes) { for (const [k, v] of Object.entries(changes)) await GM.setValue(k, v); },
+    deleteValues: async keys => keys.forEach(k => store.delete(k)),
+    setClipboard: async value => { clipboard = value; },
   };
   let panel;
-  const attachShadow = Element.prototype.attachShadow;
-  Element.prototype.attachShadow = function (options) {
-    const root = attachShadow.call(this, options);
+  const attach = Element.prototype.attachShadow;
+  Element.prototype.attachShadow = function(options) {
+    const root = attach.call(this, options);
     if (this.id === 'tut-code-meter') panel = root;
     return root;
   };
-  let analyses = 0;
-  const segment = Intl.Segmenter.prototype.segment;
-  Intl.Segmenter.prototype.segment = function (text) {
-    analyses++;
-    return segment.call(this, text);
+  document.hasFocus = () => foreground;
+  const OriginalDate = Date;
+  let offset = 0;
+  window.Date = class extends OriginalDate {
+    constructor(...args) { super(...(args.length ? args : [OriginalDate.now() + offset])); }
+    static now() { return OriginalDate.now() + offset; }
   };
+  const pause = ms => new Promise(r => setTimeout(r, ms));
+  function advanceDay() { offset += 86400000; }
+  async function until(fn) {
+    const end = performance.now() + 3500;
+    while (!fn()) { if (performance.now() > end) throw Error('時間切れ：' + fn); await pause(15); }
+  }
+  const assert = (test, msg) => { if (!test) throw Error(msg); };
+  const records = () => [...store].filter(([k]) => k.startsWith('article:')).map(([,v]) => v);
+  function click(text) {
+    const button = [...panel.querySelectorAll('button')].find(b => b.textContent === text);
+    if (!button) throw Error('ボタンが見つかりません：' + text);
+    button.click();
+  }
+  function openMenu(text) { return menus.get(text)(); }
+  function closePanelForTest() { click('閉じる'); }
+  function highlightChecked() { return panel.querySelector('[type=checkbox]').checked; }
+  function focusPage(state) { foreground = state; window.dispatchEvent(new Event(state ? 'focus' : 'blur')); }
+  const quiet = () => !document.querySelector('#tut-code-meter') && !CSS.highlights.size;
+  if (!child) {
+    for (const c of '設計築成語') store.set('known:' + c, true);
+    store.set('known:構', 'forgotten');
+    store.set('expanded', true); store.set('decorate', false);
+  }
 </script>
 <script src="../tut-code-meter.user.js"></script>
 <script>
-  const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
-  async function until(description, predicate) {
-    const start = performance.now();
-    while (!predicate()) {
-      if (performance.now() - start > 4000) throw Error(description);
-      await delay(25);
-    }
-  }
-  const shown = (selector, value) => panel?.querySelector(selector)?.textContent === value;
-  const missing = () => CSS.highlights.get('tut-code-meter-missing')?.size;
-  function assert(condition, message) { if (!condition) throw Error(message); }
-  async function testForgotten() {
-    const settings = panel.querySelector('.save').closest('details');
-    const [known, forgetInput] = settings.querySelectorAll('textarea');
-    const save = settings.querySelector('.save');
-    const forget = settings.querySelector('.forget');
-    const feedback = forget.nextElementSibling;
-    const history = settings.querySelector('ul');
-    const articleChars = panel.querySelector('details');
-    const buttonFor = (list, char) => list.querySelector('button[data-char="' + char + '"]');
-    function edit(field, text) {
-      field.value = text;
-      field.dispatchEvent(new Event('input'));
-    }
+  async function verifyHistoryLearning() {
+    const main = document.querySelector('main');
+    const otherCharacters = '空森雨雪雲風花草竹林石岩砂土田畑里村町国世界春夏秋冬東西南北大小高低海';
+    main.textContent = [...otherCharacters, ...'川山川山山'].join('、');
+    location.hash = 'mountain';
+    await until(() => records().some(record => record.url.endsWith('#mountain')));
+    main.textContent = '海、海、海、海、海';
+    location.hash = 'sea';
+    await until(() => records().some(record => record.url.endsWith('#sea')));
 
-    edit(known, known.value + '構花');
-    save.click();
-    await until('習得済み字を準備', () => shown('dd', '90%（18/20字）') && !save.disabled);
-    edit(known, known.value + '森');
-    edit(forgetInput, ' 構構\n花 木彙');
-    forget.click();
-    await until('一括で忘れた字に移動', () => shown('dd', '75%（15/20字）') && history.children.length === 2);
-    assert(shown('dd:nth-of-type(2)', '90%（18/20字）') && shown('dd:nth-of-type(3)', '83.3%（15/18字）'), '忘れた字を対象内の未習得に数える');
-    for (const message of ['移した字（2字）：構花', '習得済みにない字：木', 'TUT-Code対象外：彙']) {
-      assert(feedback.textContent.includes(message), '混在入力の結果 ' + message);
-    }
-    assert(!known.value.includes('構') && !known.value.includes('花') && known.value.includes('森'), '習得済み欄から移動し、他の編集中の字を保持');
-    assert(buttonFor(history, '花') && !buttonFor(articleChars, '花'), '記事に現れない字も全件一覧に表示');
-    const group = buttonFor(articleChars, '構').closest('ul');
-    assert(group.previousElementSibling.textContent === '忘れた字' && group.textContent.includes('構　3回'), '忘れた字の出現回数');
-    panel.querySelector('.copy').click();
-    assert(clipboard === '構築\n構成', '忘れた字の練習語をコピー');
-
-    edit(forgetInput, '構');
-    forget.click();
-    await until('二重登録を防ぐ', () => feedback.textContent.includes('すでに忘れた字：構') && history.children.length === 2);
-    save.click();
-    await until('編集内容の保存で忘れた字が復活しない', () => values['known:森'] === true && !save.disabled);
-    assert(values['known:構'] === 'forgotten', '保存後も忘れた状態を保持');
-    const range = document.createRange();
-    range.selectNodeContents(document.querySelector('#bottom span'));
-    getSelection().addRange(range);
-    await until('選択範囲での忘れた字の頻度', () => shown('.scope', '選択範囲') && articleChars.textContent.includes('構　1回'));
-    getSelection().removeAllRanges();
-    await until('全文での忘れた字の頻度', () => articleChars.textContent.includes('構　3回'));
-
-    buttonFor(history, '花').click();
-    await until('全件一覧から再習得', () => history.children.length === 1 && known.value.includes('花'));
-    buttonFor(articleChars, '構').click();
-    await until('本文から再習得', () => shown('dd', '90%（18/20字）') && history.children.length === 0);
-    edit(forgetInput, '構');
-    forget.click();
-    await until('再度忘れた字に登録', () => shown('dd', '75%（15/20字）'));
-    edit(known, known.value + '構');
-    save.click();
-    await until('一括登録から再習得', () => shown('dd', '90%（18/20字）') && history.children.length === 0);
-    edit(known, known.value.replace('構', ''));
-    save.click();
-    await until('習得済み欄からの削除は通常の未習得', () => shown('dd', '75%（15/20字）') && values['known:構'] === false);
-    assert(history.children.length === 0 && buttonFor(articleChars, '構').closest('ul').previousElementSibling.textContent === '未習得字', '直接削除と忘れた字を区別');
-
-  }
-  async function testRegistrationScroll() {
-    const letters = '一二三四五六七八九十上下左右大小天地山川田水火木金土月日年白黒赤青';
-    const chars = panel.querySelector('details');
-    const settings = panel.querySelector('.save').closest('details');
-    const words = panel.querySelector('.copy').parentElement.querySelector('ul');
-    const top = document.querySelector('#top');
-    top.textContent = [...letters].join('、');
-    document.querySelector('#bottom').textContent = '';
-    chars.open = true;
-    settings.open = true;
-    await until('長い一覧を準備', () => chars.querySelectorAll('button').length === letters.length);
-    window.scrollTo(0, 180);
-
-    function aim(button) {
+    await openMenu('学習履歴を開く');
+    await until(() => panel.querySelectorAll('article').length === 2);
+    const period = panel.querySelector('.history-characters');
+    const article = [...panel.querySelectorAll('article')].find(item => item.querySelector('pre').textContent.includes('#mountain'));
+    article.querySelector('details').open = true;
+    const individual = article.querySelector('.history-characters');
+    period.open = individual.open = true;
+    const visibleRows = group => [...group.querySelectorAll('li:not([hidden])')];
+    const leaders = group => visibleRows(group).slice(0, 2).map(row => row.firstElementChild.textContent).join('、');
+    assert(leaders(period) === '海　6回、山　3回', '期間では記事をまたいで字の出現回数を合算する');
+    assert(leaders(individual) === '山　3回、川　2回', '各記事ではその記事で多い字から表示する');
+    for (const group of [period, individual]) {
+      const rows = visibleRows(group).slice(12, 16);
+      const button = rows[0].querySelector('button');
       button.scrollIntoView({ block: 'center' });
-      const box = button.getBoundingClientRect();
-      return [box.left + box.width / 2, box.top + box.height / 2];
-    }
-    async function clickAt(point, button) {
-      const hit = panel.elementFromPoint(...point);
-      assert(hit === button, '同じ位置で次の「' + button.dataset.char + '」を押せる');
+      const { x, y, width, height } = button.getBoundingClientRect();
+      const buttonAtPoint = () => panel.elementFromPoint(x + width / 2, y + height / 2);
       const pageY = window.scrollY;
-      hit.click();
-      await until('押した行を取り除く', () => !button.isConnected);
-      await new Promise(requestAnimationFrame);
-      assert(window.scrollY === pageY, '記事本文のスクロール位置を保持');
+      assert(panel.querySelector('dialog').scrollTop > 0, '履歴を途中までスクロール');
+      for (const row of rows.slice(0, 3)) {
+        assert(buttonAtPoint() === row.querySelector('button'), '同じ位置に次の登録ボタンが来る');
+        buttonAtPoint().click();
+        await until(() => row.hidden);
+        await new Promise(requestAnimationFrame);
+        assert(window.scrollY === pageY, '連続登録中も記事本文の位置を保持');
+      }
+      assert(buttonAtPoint() === rows[3].querySelector('button'), '3字登録した後も続きの行を表示');
     }
-    async function clickThree(list, index) {
-      const buttons = [...list.querySelectorAll('button')];
-      const point = aim(buttons[index]);
-      for (const button of buttons.slice(index, index + 3)) await clickAt(point, button);
-      assert(list.contains(buttons[index + 3]), '続きの行と一覧を再利用');
-    }
-
-    const list = chars.querySelector('button').closest('ul');
-    await clickThree(list, 15);
-    await clickThree(list, 0);
-    const tail = list.lastElementChild;
-    const previous = tail.previousElementSibling;
-    const lastButton = tail.querySelector('button');
-    await clickAt(aim(lastButton), lastButton);
-    const lastBox = previous.querySelector('button').getBoundingClientRect();
-    assert(panel.elementFromPoint(lastBox.x + lastBox.width / 2, lastBox.y + lastBox.height / 2) === previous.querySelector('button'), '末尾に残った最後の字が見える');
-    assert(shown('dd', percentageFor(7, letters.length)) && words.children.length === letters.length - 7, '連続登録後のカバー率と練習候補');
-
-    top.textContent = '春、夏、秋、冬';
-    await until('短い練習候補を準備', () => words.children.length === 4 && chars.querySelectorAll('button').length === 4);
-    const wordHeight = words.getBoundingClientRect().height;
-    await clickThree(chars.querySelector('button').closest('ul'), 0);
-    assert(words.getBoundingClientRect().height < wordHeight, '練習候補の高さが縮む');
-    const only = chars.querySelector('button');
-    await clickAt(aim(only), only);
-    assert(!chars.querySelector('button') && shown('dd', '100%（4/4字）') && panel.querySelector('.copy').disabled, 'グループの最後の1字で集計とコピー対象を更新');
-
-    const [known, forget] = settings.querySelectorAll('textarea');
-    known.value = letters;
-    known.dispatchEvent(new Event('input'));
-    settings.querySelector('.save').click();
-    await until('習得済みの保存', () => !settings.querySelector('.save').disabled);
-    forget.value = letters;
-    settings.querySelector('.forget').click();
-    const history = settings.querySelector('ul');
-    await until('長い忘れた字一覧を準備', () => history.children.length === letters.length);
-    await clickThree(history, 15);
+    closePanelForTest();
   }
-  function percentageFor(count, total) {
-    return Number((100 * count / total).toFixed(1)) + '%（' + count + '/' + total + '字）';
-  }
+
   async function run() {
-    await until('初期表示と非表示要素の除外', () => shown('.scope', 'ページ全体') && shown('dd', '75%（15/20字）') && missing() === 1);
-    panel.querySelector('.copy').click();
-    assert(clipboard === '構築\n構成', '先頭での全文コピー');
-    const fullAnalyses = analyses;
-    document.querySelector('#bottom').scrollIntoView();
-    await until('スクロールで画面内の装飾を更新', () => missing() === 2);
-    assert(shown('dd', '75%（15/20字）'), '末尾でも全文の字数');
-    panel.querySelector('.copy').click();
-    assert(clipboard === '構築\n構成' && analyses === fullAnalyses, 'スクロール・コピーは全文結果を再利用');
+    await pause(320);
+    assert(quiet() && !records().length, '初期オフ・無表示');
+    await GM.setValue('historyPolicy', { mode: 'allow', hosts: ['other.test'] });
+    await pause(150); assert(!records().length && quiet(), '許可外では記録・装飾とも休止');
+    await openMenu('学習設定を開く');
+    const [hosts, learned, forgotten] = panel.querySelectorAll('textarea');
+    const learnedCount = count => learned.labels[0].textContent === '習得済みの漢字 (' + count + '文字/2525文字)';
+    assert([...learned.value].sort().join('') === [...'設計築成語'].sort().join(''), '既存習得字');
+    assert(learnedCount(5), '設定を開いた時点の習得済み字数');
+    learned.value += '構';
+    learned.dispatchEvent(new Event('input'));
+    assert(learnedCount(5), '未保存の入力は習得済み字数に含めない');
+    click('習得済み字を保存');
+    await until(() => learnedCount(6));
+    forgotten.value = '構';
+    click('忘れた字に移す');
+    await until(() => learnedCount(5));
+    panel.querySelector('select').value = 'exclude'; hosts.value = 'other.test';
+    click('記録設定を保存');
+    await until(() => store.get('historyPolicy')?.mode === 'exclude');
+    assert(!panel.querySelector('[type=checkbox]').checked, '旧版のハイライトオフを引き継ぐ');
+    focusPage(false); closePanelForTest();
+    meeting = true; await GM.setValue('meetRevision', 1); focusPage(true);
+    await pause(150); assert(!records().length && quiet(), 'Meetで休止');
+    focusPage(false); meeting = false; await GM.setValue('meetRevision', 2);
+    await pause(150); assert(!records().length, '非アクティブのままMeetが終了');
+    const before = Date.now();
+    focusPage(true); focusPage(false);
+    const after = Date.now();
+    await until(() => records().length === 1);
+    const first = records()[0];
+    assert(first.at >= before && first.at <= after, '一瞬のフォーカスの日時で保存');
+    assert(first.metrics.map(m => m.percent).join() === '75%,90%,83.3%', 'ページ全体の3指標');
+    assert(first.words.map(w => w.word + w.count).join() === '構築2,語彙2,構成1', '未知語と出現回数');
 
-    const range = document.createRange();
-    range.selectNodeContents(document.querySelector('#bottom span'));
-    getSelection().addRange(range);
-    await until('選択した語だけを集計・装飾', () => shown('.scope', '選択範囲') && shown('dd', '50%（1/2字）') && missing() === 1);
-    panel.querySelector('.copy').click();
-    assert(clipboard === '構成', '選択範囲のコピー');
+    const marked = kind => [...CSS.highlights.get('tut-code-meter-' + kind) || []].map(r => r.toString()).join('');
+    focusPage(true); await pause(150); assert(quiet(), '旧設定オフでは装飾しない');
+    await openMenu('学習設定を開く');
+    panel.querySelector('[type=checkbox]').click();
+    await until(() => store.get('decorate') === true);
+    closePanelForTest();
+    const extra = document.createElement('p');
+    extra.textContent = '新聞'; document.querySelector('main').prepend(extra);
+    window.scrollTo(0, 0);
+    await until(() => marked('missing') === '新聞構');
+    focusPage(false);
+    extra.textContent = '新聞紙';
+    await until(() => marked('missing') === '新聞紙構');
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+    document.dispatchEvent(new Event('visibilitychange'));
+    extra.textContent = '新聞';
+    await pause(120); assert(quiet(), '非表示タブでは装飾を休止');
+    delete document.visibilityState;
+    document.dispatchEvent(new Event('visibilitychange'));
+    await until(() => marked('missing') === '新聞構');
+    meeting = true; await GM.setValue('meetRevision', 3);
+    await until(quiet);
+    meeting = false; await GM.setValue('meetRevision', 4);
+    await until(() => marked('missing') === '新聞構');
+    assert(JSON.stringify(records()) === JSON.stringify([first]), '非フォーカス時は装飾だけを更新');
+    assert(!marked('outside') && !document.querySelector('#tut-code-meter'), '画面外・習得済みを装飾しない');
+    const css = kind => getComputedStyle(extra, '::highlight(tut-code-meter-' + kind + ')');
+    assert(css('missing').backgroundColor === 'rgb(255, 240, 173)' && css('outside').textDecorationStyle === 'dotted', '黄色の背景と点線');
+    document.querySelector('main > p:last-child').scrollIntoView();
+    await until(() => marked('outside') === '彙彙' && marked('missing') === '構構');
+    const selected = document.querySelector('main > p:last-child').firstChild;
+    const range = document.createRange(); range.setStart(selected, 0); range.setEnd(selected, 2);
+    getSelection().removeAllRanges(); getSelection().addRange(range);
+    await until(() => marked('missing') === '構' && !marked('outside'));
     getSelection().removeAllRanges();
-    await until('選択解除で全文を復元', () => shown('.scope', 'ページ全体') && shown('dd', '75%（15/20字）'));
-    assert(analyses === fullAnalyses + 1, '選択解除は全文結果を再利用');
+    await until(() => marked('outside') === '彙彙');
+    await openMenu('学習設定を開く'); click('習得済みに戻す');
+    await until(() => panel.querySelectorAll('textarea')[1].labels[0].textContent === '習得済みの漢字 (6文字/2525文字)');
+    closePanelForTest();
+    await until(() => !marked('missing') && marked('outside') === '彙彙');
+    assert(JSON.stringify(records()[0]) === JSON.stringify(first), '装飾・再習得が過去の記録に影響しない');
+    await openMenu('学習設定を開く'); panel.querySelector('[type=checkbox]').click(); closePanelForTest();
+    await until(() => quiet() && store.get('decorate') === false);
+    // A new tab without a legacy preference should highlight by default.
+    store.delete('decorate');
+    extra.remove();
 
-    await testForgotten();
-    getSelection().addRange(range);
-    await until('段落の再選択', () => shown('.scope', '選択範囲'));
-    document.querySelector('#top').append('、構成、構成');
-    await delay(250);
-    assert(shown('dd', '50%（1/2字）'), '画面外の追記中も選択範囲を維持');
-    getSelection().removeAllRanges();
-    await until('追加された段落を一度だけ加算', () => shown('dd', '70.8%（17/24字）'));
-    panel.querySelector('.copy').click();
-    assert(clipboard === '構成\n構築', '追記後の全文の頻度順');
-    await testRegistrationScroll();
+    // Child documents inherit the test origin and share only the GM storage.
+    async function sibling(isPrivate) {
+      const iframe = document.createElement('iframe');
+      if (isPrivate) iframe.setAttribute('data-private', '');
+      const clone = document.documentElement.cloneNode(true);
+      clone.querySelectorAll('iframe').forEach(n => n.remove());
+      const loaded = new Promise(resolve => iframe.onload = resolve);
+      iframe.srcdoc = '<!doctype html>' + clone.outerHTML;
+      document.body.append(iframe); await loaded;
+      return iframe.contentWindow;
+    }
+    const privateTab = await sibling(true);
+    assert(privateTab.menuCount() === 0, 'シークレットで未起動');
+    const otherTab = await sibling(false);
+    const article = otherTab.document.querySelector('main');
+    await pause(180);
+    assert(records().length === 1, '一度もフォーカスしていない記事は保存しない');
+    await otherTab.openMenu('学習設定を開く');
+    assert(otherTab.document.querySelector('#tut-code-meter') && otherTab.highlightChecked(), '未設定の初期値はオン');
+    otherTab.closePanelForTest();
+    article.textContent = 'loading';
+    focusPage(false);
+    otherTab.focusPage(true); otherTab.focusPage(false); await pause(120);
+    await GM.setValue('historyPolicy', { mode: 'off', hosts: [] });
+    article.textContent = '語彙';
+    await GM.setValue('historyPolicy', { mode: 'exclude', hosts: ['other.test'] });
+    await pause(180);
+    assert(records().length === 1, '記録を停止すると本文待ちの閲覧も取り消す');
+    article.textContent = 'loading';
+    const entered = Date.now();
+    otherTab.focusPage(true); otherTab.focusPage(false);
+    const left = Date.now();
+    otherTab.advanceDay(); await pause(180);
+    assert(records().length === 1, '漢字のない記事は保存しない');
+    await GM.setValues({ 'known:語': 'forgotten', learnedRevision: 'late-profile' });
+    article.textContent = '語彙';
+    await until(() => records().some(r => r.url !== first.url));
+    const late = records().find(r => r.url !== first.url);
+    assert(late.at >= entered && late.at <= left && late.day === first.day, '翌日に本文が届いてもフォーカス日時で記録');
+    assert(late.words[0].missing.join('') === '彙', '遅延読み込みでもフォーカス時の習得状態を使用');
+    // Simulate tomorrow in the main tab and return to the same article.
+    offset = 86400000;
+    focusPage(false); focusPage(true);
+    await until(() => records().some(r => r.day !== first.day));
+    await openMenu('学習履歴を開く');
+    const today = records().find(r => r.day !== first.day).day;
+    const articleCount = () => panel.querySelectorAll('article').length;
+    const report = () => panel.querySelector('pre')?.textContent;
+    const action = (name, root = panel) => [...root.querySelectorAll('button')].find(b => b.textContent === name);
+    function setPeriod(from, to) {
+      const [start, end] = panel.querySelectorAll('input[type=date]');
+      start.value = from; end.value = to; end.dispatchEvent(new Event('input'));
+    }
+    function assertToday() {
+      assert([...panel.querySelectorAll('input[type=date]')].every(input => input.value === today), '開いた日の現地日付');
+    }
+    await until(() => articleCount() === 1);
+    assertToday();
+    setPeriod(first.day, today);
+    await until(() => articleCount() === 3);
+    assert(report().includes(first.day + ' ～ ' + today) && report().includes('記事件数　3件'), '複数日で1件の集計');
+    setPeriod(first.day, first.day);
+    await until(() => articleCount() === 2);
+    click('この期間の記録をコピー');
+    assert(clipboard === report() && clipboard.includes('記事件数　2件') && clipboard.includes('72.7%（16/22字）') &&
+      clipboard.endsWith('未知語\n構築　2回\n構成　1回'), '期間画面とコピーには外字を含まない語だけ表示');
+    click('未知語をコピー'); assert(clipboard === '構築\n構成', '期間の単語コピーから外字を含む語を除く');
+    click('未知語をコピー(外字含む)'); assert(clipboard === '語彙\n構築\n構成', '期間の単語コピーに外字を含む語も入れる');
+    const match = [...panel.querySelectorAll('article')].find(a => a.querySelector('pre').textContent.includes(first.url));
+    match.querySelector('details').open = true;
+    assert(!match.querySelector('pre').textContent.includes('語彙'), '記事明細に外字を含む語を出さない');
+    match.querySelector('button').click();
+    assert(clipboard === match.querySelector('pre').textContent, '記事コピーと画面の一致');
+    action('未知語をコピー', match).click();
+    assert(clipboard === '構築\n構成', '記事の単語コピーから外字を含む語を除く');
+    action('未知語をコピー(外字含む)', match).click();
+    assert(clipboard === '構築\n語彙\n構成', '外字を含む語も記事内の順序でコピー');
+    const periodCharacters = panel.querySelector('.history-characters');
+    const articleCharacters = match.querySelector('.history-characters');
+    periodCharacters.open = articleCharacters.open = true;
+    const characterRow = group => group.querySelector('li[data-char="構"]');
+    assert(characterRow(periodCharacters).firstElementChild.textContent === '構　3回' &&
+      characterRow(articleCharacters).firstElementChild.textContent === '構　3回', '期間と記事の未習得字に延べ出現回数を表示');
+    assert(characterRow(periodCharacters).hidden && characterRow(articleCharacters).hidden, '習得済みの字は登録候補に出さない');
+    assert(!periodCharacters.querySelector('li[data-char="彙"]'), '外字は登録候補に出さない');
+    const priorReport = report();
+    const priorArticle = match.querySelector('pre').textContent;
+    for (const group of [periodCharacters, articleCharacters]) {
+      await GM.setValues({ 'known:構': 'forgotten', learnedRevision: Math.random() });
+      assert(!characterRow(periodCharacters).hidden && !characterRow(articleCharacters).hidden, '忘れた字は両方の候補に出す');
+      characterRow(group).querySelector('button').click();
+      await until(() => store.get('known:構') === true && characterRow(periodCharacters).hidden && characterRow(articleCharacters).hidden);
+      await pause(0);
+    }
+    assert(periodCharacters.open && articleCharacters.open && report() === priorReport &&
+      match.querySelector('pre').textContent === priorArticle, '習得登録後も展開状態と閲覧時の記録を保持');
+    action('この記事の記録を削除', match).click(); click('削除する');
+    await until(() => articleCount() === 1 && report().includes('記事件数　1件'));
+    const outsideOnly = panel.querySelector('article');
+    assert(report().endsWith('未知語\nなし') && outsideOnly.querySelector('pre').textContent.endsWith('未知語\nなし'),
+      '外字を含む語だけの期間と記事は未知語なしと表示');
+    assert(action('未知語をコピー').disabled && action('未知語をコピー', outsideOnly).disabled, '外字を含む語だけなら通常の単語コピーは無効');
+    click('未知語をコピー(外字含む)'); assert(clipboard === '語彙', '削除後は残った記事から集計');
+    outsideOnly.querySelector('details').open = true;
+    action('未知語をコピー(外字含む)', outsideOnly).click();
+    assert(clipboard === '語彙', '外字を含む語だけの記事でもコピー可能');
+    closePanelForTest();
+    article.textContent = '設計';
+    otherTab.focusPage(true);
+    await until(() => records().some(r => r.day === today && !r.words.length));
+    await openMenu('学習履歴を開く');
+    assertToday();
+    await until(() => articleCount() === 2);
+    const mainToday = [...panel.querySelectorAll('article')].find(a => a.querySelector('pre').textContent.includes(first.url));
+    mainToday.querySelector('details').open = true;
+    action('この記事の記録を削除', mainToday).click(); click('削除する');
+    await until(() => articleCount() === 1 && report().endsWith('未知語\nなし'));
+    assert(action('未知語をコピー').disabled && !action('この期間の記録をコピー').disabled, '未知語ゼロでも指標をコピー可能');
+    assert(action('未知語をコピー', panel.querySelector('article')).disabled, '未知語ゼロの記事では単語コピー不可');
+    assert(action('未知語をコピー(外字含む)').disabled &&
+      action('未知語をコピー(外字含む)', panel.querySelector('article')).disabled, '未知語ゼロでは外字込みのコピーも不可');
+    click('この期間の記録をコピー'); assert(clipboard === report(), '未知語ゼロの期間コピー');
+    await pause(0);
+    const setClipboard = GM.setClipboard;
+    let finishCopy;
+    GM.setClipboard = () => new Promise(resolve => { finishCopy = resolve; });
+    click('この期間の記録をコピー');
+    setPeriod(today, first.day);
+    finishCopy(); await pause(0); GM.setClipboard = setClipboard;
+    assert(action('未知語をコピー').disabled && action('この期間の記録をコピー').disabled &&
+      panel.textContent.includes('終了日は開始日以降'), '前のコピーが完了しても無効な期間の案内とボタン状態を維持');
+    setPeriod('', '2000-01-01');
+    await until(() => panel.textContent.includes('この期間の記録はありません。'));
+    assert(action('未知語をコピー').disabled && action('この期間の記録をコピー').disabled, '履歴ゼロではコピー不可');
+    click('全件を削除'); click('キャンセル');
+    await pause(0);
+    assert(records().length === 2, '削除のキャンセル');
+    click('全件を削除'); click('削除する');
+    await until(() => records().length === 0);
+    assert(store.get('known:構') === true && store.has('historyPolicy'), '全件削除後も設定を保持');
+    closePanelForTest();
+    await verifyHistoryLearning();
+    document.getElementById('result').textContent = 'PASS';
   }
-  run().then(() => { document.querySelector('#result').textContent = 'PASS'; })
-    .catch(error => { document.querySelector('#result').textContent = 'FAIL: ' + error.message; });
+  if (!child) run().catch(e => { document.getElementById('result').textContent = 'FAIL ' + e.message; console.error(e); });
 </script>
 </html>

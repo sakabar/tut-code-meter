@@ -1,13 +1,20 @@
 // ==UserScript==
 // @name         tut-code-meter
 // @namespace    https://github.com/sakabar/tut-code-meter
-// @version      1.2.1
-// @description  ページ本文全体や選択範囲のTUT-Codeカバー率を測り、未習得字を含む練習語をコピーします。
+// @version      2.2.6
+// @description  許可したページのTUT-Codeカバー率と未知語を端末内に記録し、あとから振り返ります。
 // @license      MIT AND BSD-3-Clause
 // @match        https://*/*
 // @match        http://*/*
 // @noframes
 // @run-at       document-start
+// @run-in       normal-tabs
+// @sandbox      DOM
+// @grant        GM_info
+// @grant        GM_registerMenuCommand
+// @grant        GM.listValues
+// @grant        GM.deleteValues
+// @grant        GM.getValues
 // @grant        GM_getValues
 // @grant        GM.setValues
 // @grant        GM.setValue
@@ -186,10 +193,206 @@ SUCH DAMAGE.
     return url.origin === 'https://meet.google.com' && /^\/[a-z]{3}-[a-z]{4}-[a-z]{3}\/?$/.test(url.pathname);
   }
 
+  const metricNames = ['現在のカバー率', '全習得時のカバー率', '対象内の習得率'];
+  const pad = n => String(n).padStart(2, '0');
+  const localDay = date => [date.getFullYear(), pad(date.getMonth() + 1), pad(date.getDate())].join('-');
+  const nonce = () => crypto.getRandomValues(new Uint32Array(3)).join('-');
+  const profileKeys = [...target].map(char => 'known:' + char);
+
+  function snapshot(text, states, page, date) {
+    const learned = new Set([...target].filter(char => states['known:' + char] === true));
+    const { counts, characters, words } = analyze(text, learned);
+    const inside = counts.learned + counts.missing;
+    const total = inside + counts.outside;
+    if (!total) return null;
+    return {
+      ...page, at: date.getTime(), day: localDay(date),
+      time: [date.getHours(), date.getMinutes(), date.getSeconds()].map(pad).join(':'),
+      metrics: [[counts.learned, total], [inside, total], [counts.learned, inside]].map(
+        ([num, den]) => ({ num, den, percent: percentage(num, den) })),
+      missingCharacters: characters.filter(item => item.kind === 'missing').map(({ char, count }) => ({ char, count })),
+      words: words.map(item => ({ ...item, forgotten: item.missing.filter(char => states['known:' + char] === 'forgotten') })),
+    };
+  }
+
+  function rankMissingCharacters(records) {
+    const counts = new Map();
+    const add = (char, count) => counts.set(char, (counts.get(char) || 0) + count);
+    for (const record of records) {
+      if (record.missingCharacters) {
+        for (const { char, count } of record.missingCharacters) add(char, count);
+      } else {
+        // Older records only retain occurrences of words containing unknown characters.
+        for (const { word, missing, count } of record.words) {
+          for (const char of word) if (target.has(char) && missing.includes(char)) add(char, count);
+        }
+      }
+    }
+    return [...counts].sort(([ , a], [ , b]) => b - a);
+  }
+
+  function metricLine({ num, den, percent = percentage(num, den) }, index) {
+    return metricNames[index] + '　' + percent + '（' + num + '/' + den + '字）';
+  }
+
+  // history.list supplies the latest record per URL/day, newest first.
+  function summarizePeriod(records, start, end) {
+    const totals = metricNames.map(() => ({ num: 0, den: 0 }));
+    const counts = new Map();
+    for (const record of records) {
+      record.metrics.forEach(({ num, den }, i) => {
+        totals[i].num += num;
+        totals[i].den += den;
+      });
+      for (const { word, count, outside } of record.words) {
+        const total = counts.get(word);
+        counts.set(word, { word, count: (total?.count || 0) + count, outside: outside || total?.outside });
+      }
+    }
+    // A stable sort retains first appearance in the selected history on ties.
+    const words = [...counts.values()].sort((a, b) => b.count - a.count);
+    const tutWords = words.filter(item => !item.outside);
+    let period = '全期間';
+    if (start && end) period = start === end ? start : start + ' ～ ' + end;
+    else if (start) period = start + ' 以降';
+    else if (end) period = end + ' 以前';
+    const text = [
+      '期間　' + period, '記事件数　' + records.length + '件',
+      ...totals.map(metricLine), '未知語',
+      ...(tutWords.length ? tutWords.map(({ word, count }) => word + '　' + count + '回') : ['なし']),
+    ].join('\n');
+    return { text, wordText: practiceText(words, true), tutWordText: practiceText(words, false) };
+  }
+
+  function recordText(record) {
+    const words = record.words.filter(item => !item.outside);
+    return [
+      record.day + ' ' + record.time, record.title, record.siteName, record.url,
+      ...record.metrics.map(metricLine),
+      '未知語', ...(words.length ? words.map(item => [
+        item.word + '　' + item.count + '回', '打てなかった字：' + item.missing.join('・'),
+        ...(item.forgotten.length ? ['忘れた字：' + item.forgotten.join('・')] : []),
+      ].join(' ／ ')) : ['なし']),
+    ].join('\n');
+  }
+
+  function parseHosts(input) {
+    const hosts = new Set();
+    for (const item of input.split(/[\s,、]+/u).filter(Boolean)) {
+      // URL normalizes IDNs and IPv6. Require a hostname, without paths, ports or wildcards.
+      if (/[/@?#*\\%]/u.test(item) || (item.includes(':') && !(item.startsWith('[') && item.endsWith(']')))) throw Error(item);
+      const host = new URL('http://' + item).hostname.replace(/\.$/, '');
+      if (!host || (!host.startsWith('[') && !host.split('.').every(label => /^[a-z\d](?:[a-z\d-]*[a-z\d])?$/i.test(label)))) throw Error(item);
+      hosts.add(host);
+    }
+    return [...hosts];
+  }
+
+  function permits(policy, hostname) {
+    if (!policy || !Array.isArray(policy.hosts)) return false;
+    const listed = policy.hosts.includes(hostname.replace(/\.$/, ''));
+    return policy.mode === 'allow' ? listed : policy.mode === 'exclude' && !listed;
+  }
+
+  // A deletion fence only needs an opaque scope identifier and a cutoff time.
+  // Use the same fingerprint on HTTPS and HTTP, where SubtleCrypto is unavailable.
+  function scopeId(scope) {
+    let hash = 0xcbf29ce484222325n;
+    for (let i = 0; i < scope.length; i++) {
+      hash = BigInt.asUintN(64, (hash ^ BigInt(scope.charCodeAt(i))) * 0x100000001b3n);
+    }
+    return hash.toString(36);
+  }
+  const hostnameOf = url => new URL(url).hostname.replace(/\.$/, '');
+  const allFence = 'historyDeleted';
+  const siteFence = host => allFence + ':' + scopeId(host);
+  const articleFence = (day, url) => siteFence(hostnameOf(url)) + ':' + scopeId(day + '\n' + url);
+  const recordPrefix = (day, url) => 'article:' + day + '\n' + url + '\n';
+
+  // Distinct writes never overwrite one another, even from different origins.
+  // The most recent version wins. Superseded versions can be removed independently.
+  function historyStore(storage) {
+    async function blocked(day, url, since) {
+      const keys = [allFence, siteFence(hostnameOf(url)), articleFence(day, url)];
+      const values = await storage.getValues(keys);
+      return keys.some(key => values[key] >= since);
+    }
+    async function save(record, since, eligible) {
+      const { day, url } = record;
+      const prefix = recordPrefix(day, url);
+      const key = prefix + String(record.at).padStart(16, '0') + '-' + nonce();
+      if (await blocked(day, url, since) || !eligible()) return;
+      await storage.setValue(key, { ...record, started: since });
+      if (await blocked(day, url, since)) {
+        await storage.deleteValues([key]);
+        return;
+      }
+      const versions = (await storage.listValues()).filter(k => k.startsWith(prefix));
+      const older = versions.filter(k => k < key);
+      // A slower tab can finish writing after the latest visit already compacted the group.
+      const newer = versions.filter(k => k > key);
+      if (newer.length) {
+        const candidates = Object.values(await storage.getValues(newer));
+        for (const candidate of candidates) {
+          if (candidate && !await blocked(day, url, candidate.started)) { older.push(key); break; }
+        }
+      }
+      if (older.length) await storage.deleteValues(older);
+    }
+    async function list(start = '', end = '') {
+      const groups = new Map();
+      for (const key of await storage.listValues()) {
+        if (!key.startsWith('article:')) continue;
+        const day = key.slice(8, 18);
+        if ((start && day < start) || (end && day > end)) continue;
+        const group = key.slice(0, key.lastIndexOf('\n'));
+        if (!groups.has(group)) groups.set(group, []);
+        groups.get(group).push(key);
+      }
+      if (!groups.size) return [];
+      const keys = new Set([allFence]);
+      for (const versions of groups.values()) {
+        const [dateKey, url] = versions[0].split('\n');
+        keys.add(siteFence(hostnameOf(url)));
+        keys.add(articleFence(dateKey.slice(8), url));
+        for (const key of versions) keys.add(key);
+      }
+      const values = await storage.getValues([...keys]);
+      const records = [];
+      for (const versions of groups.values()) {
+        for (const key of versions.sort().reverse()) {
+          const record = values[key];
+          if (!record || [allFence, siteFence(record.host), articleFence(record.day, record.url)]
+            .some(fence => values[fence] >= record.started)) continue;
+          records.push(record);
+          break;
+        }
+      }
+      return records.sort((a, b) => b.at - a.at || a.url.localeCompare(b.url));
+    }
+    async function remove(scope) {
+      const cutoff = Date.now();
+      const fence = scope.url ? articleFence(scope.day, scope.url) : scope.host ? siteFence(scope.host) : allFence;
+      await storage.setValue(fence, cutoff);
+      const obsolete = [];
+      for (const key of await storage.listValues()) {
+        if (!key.startsWith('article:')) continue;
+        const [dateKey, url, version] = key.split('\n');
+        if (scope.url && (scope.url !== url || dateKey !== 'article:' + scope.day)) continue;
+        if (scope.host && hostnameOf(url) !== scope.host) continue;
+        if (Number(version.split('-')[0]) <= cutoff) obsolete.push(key);
+      }
+      if (obsolete.length) await storage.deleteValues(obsolete);
+    }
+    return { save, list, remove, blocked };
+  }
+
   if (typeof document === 'undefined') {
-    module.exports = { target, parseLearned, classifyForgetInput, analyze, percentage, practiceText, isMeeting };
+    module.exports = { target, parseLearned, classifyForgetInput, analyze, percentage, practiceText, isMeeting,
+      snapshot, recordText, summarizePeriod, rankMissingCharacters, parseHosts, permits, historyStore, localDay };
     return;
   }
+  if (GM_info.isIncognito) return;
 
   const skip = [
     'script, style, noscript, template, nav, aside, dialog, input, textarea, select, button, rt, rp',
@@ -198,6 +401,7 @@ SUCH DAMAGE.
     '[contenteditable]:not([contenteditable="false"]), [aria-hidden="true"], [hidden]',
     '[role="navigation"], [role="banner"], [role="complementary"], [role="contentinfo"], [role="dialog"]',
   ].join(', ');
+
   const mainSelector = 'main, article, [role="main"]';
 
   function intersects(rect, clip) {
@@ -231,6 +435,7 @@ SUCH DAMAGE.
   }
 
   function collect(selection, visibleOnly = false) {
+    if (!document.body) return [];
     const viewport = visibleOnly
       ? { left: 0, top: 0, right: document.documentElement.clientWidth, bottom: innerHeight }
       : null;
@@ -300,15 +505,10 @@ SUCH DAMAGE.
     return pieces;
   }
 
-  function sheet(css) {
-    const result = new CSSStyleSheet();
-    result.replaceSync(css);
-    return result;
-  }
-
   const missingMark = 'tut-code-meter-missing';
   const outsideMark = 'tut-code-meter-outside';
-  const markStyle = sheet(`
+  const markStyle = new CSSStyleSheet();
+  markStyle.replaceSync(`
     ::highlight(${missingMark}) { background-color: #fff0ad; color: #322d20; }
     ::highlight(${outsideMark}) { text-decoration: underline dotted #808080; }
   `);
@@ -316,13 +516,13 @@ SUCH DAMAGE.
     CSS.highlights.delete(missingMark);
     CSS.highlights.delete(outsideMark);
   }
-  function mark(pieces, learned) {
+  function mark(pieces, states) {
     const missing = new Highlight();
     const outside = new Highlight();
     for (const { node, start, end } of pieces) {
       let offset = start;
       for (const char of node.data.slice(start, end)) {
-        if (kanji.test(char) && !learned.has(char)) {
+        if (kanji.test(char) && states['known:' + char] !== true) {
           const range = document.createRange();
           range.setStart(node, offset);
           range.setEnd(node, offset + char.length);
@@ -334,367 +534,6 @@ SUCH DAMAGE.
     if (!document.adoptedStyleSheets.includes(markStyle)) document.adoptedStyleSheets.push(markStyle);
     CSS.highlights.set(missingMark, missing);
     CSS.highlights.set(outsideMark, outside);
-  }
-
-  function el(tag, text, className) {
-    const element = document.createElement(tag);
-    if (text !== undefined) element.textContent = text;
-    if (className) element.className = className;
-    return element;
-  }
-
-  const host = el('div');
-  host.id = 'tut-code-meter';
-  const shadow = host.attachShadow({ mode: 'closed' });
-  shadow.adoptedStyleSheets = [sheet(`
-    :host { all: initial !important; position: fixed !important; right: 12px !important;
-      bottom: 14px !important; z-index: 2147483646 !important; display: block !important;
-      width: max-content !important; max-width: calc(100vw - 24px) !important;
-      color-scheme: light; direction: ltr; }
-    * { box-sizing: border-box; }
-    .meter { color: #273932; background: #fafbf8; font: 13px/1.55 system-ui, sans-serif;
-      border: 1px solid #bac8bc; border-radius: 10px; overflow: hidden;
-      box-shadow: 0 2px 12px #172c231c; max-width: 100%; }
-    button, textarea, input { font: inherit; color: inherit; }
-    button { cursor: pointer; background: #fff; border: 1px solid #b8c6bc; border-radius: 6px; }
-    button:focus-visible, summary:focus-visible, textarea:focus-visible { outline: 2px solid #227356; outline-offset: -2px; }
-    button:hover { background: #ebf1ea; }
-    button:disabled { opacity: .6; cursor: default; }
-    .toggle { border: 0; width: 100%; min-height: 30px; padding: 4px 10px;
-      background: transparent; display: flex; justify-content: space-between; align-items: center;
-      gap: 12px; font-weight: 600; font-variant-numeric: tabular-nums; }
-    .toggle::after { content: '▴'; font-size: 10px; color: #566a5e; }
-    .toggle[aria-expanded="true"]::after { content: '▾'; }
-    .panel { border-top: 1px solid #d8dfd6; width: 320px; max-width: calc(100vw - 26px);
-      max-height: min(66vh, 570px); overflow-y: auto; overscroll-behavior: contain; padding: 12px; }
-    .scope, .meta { color: #516459; font-size: 12px; }
-    .metrics { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; margin: 6px 0; }
-    .metrics dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
-    .metrics dd:first-of-type { color: #206448; font-weight: 700; }
-    h2, summary { font-size: 13px; font-weight: 650; }
-    h2 { margin: 12px 0 3px; }
-    summary { cursor: pointer; padding: 6px 0; }
-    ul { padding: 0; margin: 0; list-style: none; max-height: 13em; overflow-y: auto; }
-    li { display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
-      border-bottom: 1px solid #e1e8df; padding: 4px 0; overflow-wrap: anywhere; }
-    .word { font-weight: 600; }
-    .note { font-size: 12px; margin-left: 7px; color: #5e6459; }
-    .quantity { flex-shrink: 0; }
-    .copy { background: #285e49; color: white; width: 100%; padding: 5px 8px; font-weight: 600; }
-    .copy:hover { background: #204e3c; }
-    .option { display: flex; align-items: center; gap: 5px; margin: 6px 0; }
-    .editor { display: block; margin: 8px 0 4px; }
-    textarea { width: 100%; min-height: 55px; resize: vertical; display: block; }
-    .save, .forget { margin-top: 5px; }
-    .status:not(:empty) { margin-top: 5px; font-size: 12px; }
-    [hidden] { display: none !important; }
-  `)];
-  const meter = el('section', undefined, 'meter');
-  meter.setAttribute('aria-label', 'TUT-Code カバー率');
-  const toggle = el('button', '現在 —', 'toggle');
-  const panel = el('div', undefined, 'panel');
-  panel.id = 'details';
-  toggle.setAttribute('aria-controls', panel.id);
-  const scope = el('div', '', 'scope');
-  const metrics = el('dl', undefined, 'metrics');
-  const metricValues = ['現在', '全習得時', '対象内の習得率'].map(label => {
-    const value = el('dd');
-    metrics.append(el('dt', label), value);
-    return value;
-  });
-  const totals = el('div', '', 'meta');
-  const wordList = el('ul');
-  const charList = el('div');
-  const charGroups = {};
-  for (const [kind, label] of [['forgotten', '忘れた字'], ['missing', '未習得字'], ['outside', '外字']]) {
-    const heading = el('h2', label);
-    const list = el('ul');
-    charList.append(heading, list);
-    charGroups[kind] = list;
-  }
-  const copy = el('button', '単語をコピー', 'copy');
-  function option(label) {
-    const wrapper = el('label', undefined, 'option');
-    const input = el('input');
-    input.type = 'checkbox';
-    wrapper.append(input, label);
-    return { wrapper, input };
-  }
-  function status() {
-    const output = el('div', undefined, 'status');
-    output.setAttribute('role', 'status');
-    return output;
-  }
-  const includeOutside = option('外字を含む語もコピー');
-  const decorate = option('本文の未習得字と外字を装飾');
-  const copyStatus = status();
-  const settings = el('details');
-  const editLabel = el('label', '習得済みの漢字', 'editor');
-  const editor = el('textarea');
-  editor.placeholder = '習得済みの漢字を貼り付け';
-  editLabel.append(editor);
-  const save = el('button', '習得済み字を保存', 'save');
-  const saveStatus = status();
-  const forgetLabel = el('label', '忘れた字', 'editor');
-  const forgetEditor = el('textarea');
-  forgetEditor.placeholder = '忘れた漢字をまとめて入力';
-  forgetLabel.append(forgetEditor);
-  const forget = el('button', '忘れた字に移す', 'forget');
-  const forgetStatus = status();
-  const forgottenCount = el('h2', '忘れた字の一覧（0字）');
-  const forgottenList = el('ul');
-  settings.append(el('summary', '設定'), decorate.wrapper, editLabel, save, saveStatus,
-    forgetLabel, forget, forgetStatus, forgottenCount, forgottenList);
-  const chars = el('details');
-  chars.append(el('summary', '打てない字と出現回数'), charList);
-  panel.append(scope, metrics, totals, el('h2', '練習候補'), copy, includeOutside.wrapper,
-    copyStatus, wordList, chars, settings);
-  meter.append(toggle, panel);
-  shadow.append(meter);
-
-  let learned = new Set();
-  let forgotten = new Set();
-  let editBaseline = new Set();
-  let editDirty = false;
-  let expanded = false;
-  let clipboardText = '';
-  let active = false;
-  let suspended = false;
-  let savedSelection = null;
-  let interacting = false;
-  let refreshTimer;
-  let marksTimer;
-  let markedSelection = null;
-  let pageDirty = true;
-  let pageCache = {};
-  let selectionCache = {};
-  let renderedResult;
-
-  function readSettings() {
-    const values = GM_getValues();
-    // Legacy true/false values retain their meanings. A character has one
-    // storage key so it cannot be both learned and forgotten.
-    const nextLearned = [];
-    const nextForgotten = [];
-    for (const char of target) {
-      const state = values['known:' + char];
-      if (state === true) nextLearned.push(char);
-      else if (state === 'forgotten') nextForgotten.push(char);
-    }
-    if (learned.size !== nextLearned.length || nextLearned.some(char => !learned.has(char))) {
-      learned = new Set(nextLearned);
-      pageCache.result = selectionCache.result = null;
-    }
-    if (forgotten.size !== nextForgotten.length || nextForgotten.some(char => !forgotten.has(char))) {
-      forgotten = new Set(nextForgotten);
-      forgottenCount.textContent = `忘れた字の一覧（${forgotten.size}字）`;
-      updateCharacterRows(forgottenList, 'forgotten', new Map(nextForgotten.map(char => [char, undefined])));
-    }
-    expanded = values.expanded === true;
-    decorate.input.checked = values.decorate === true;
-    includeOutside.input.checked = values.includeOutside === true;
-    panel.hidden = !expanded;
-    toggle.setAttribute('aria-expanded', String(expanded));
-    if (!editDirty) {
-      editBaseline = new Set(learned);
-      editor.value = [...learned].join('');
-    } else {
-      // Keep unrelated draft edits when a saved character is forgotten here or in another tab.
-      const removed = new Set([...editBaseline].filter(char => forgotten.has(char)));
-      if (removed.size) {
-        editor.value = [...editor.value].filter(char => !removed.has(char)).join('');
-        for (const char of removed) editBaseline.delete(char);
-      }
-    }
-    renderedResult = null;
-    schedule(0);
-  }
-
-  for (const key of ['expanded', 'decorate', 'includeOutside', 'learnedRevision']) {
-    GM_addValueChangeListener(key, readSettings);
-  }
-  async function storeOption(key, value) {
-    try {
-      await GM.setValue(key, value);
-    } finally {
-      readSettings();
-    }
-  }
-  toggle.onclick = () => storeOption('expanded', !expanded);
-  includeOutside.input.onchange = () => storeOption('includeOutside', includeOutside.input.checked);
-  decorate.input.onchange = () => storeOption('decorate', decorate.input.checked);
-
-  editor.oninput = () => { editDirty = true; saveStatus.textContent = ''; };
-  const nonce = () => Date.now() + '-' + Math.random();
-  async function writeCharacterStates(changes) {
-    if (Object.keys(changes).length) {
-      await GM.setValues({ ...changes, learnedRevision: nonce() });
-    }
-    readSettings();
-  }
-  save.onclick = async () => {
-    const parsed = parseLearned(editor.value);
-    // Store the edits relative to what the user saw. Concurrent edits to
-    // other characters in another tab survive a bulk save.
-    const changes = {};
-    const stored = GM_getValues();
-    for (const char of editBaseline) {
-      const key = 'known:' + char;
-      if (!parsed.learned.has(char) && stored[key] === true) changes[key] = false;
-    }
-    for (const char of parsed.learned) if (!editBaseline.has(char)) changes['known:' + char] = true;
-    save.disabled = editor.disabled = true;
-    try {
-      await writeCharacterStates(changes);
-      editDirty = false;
-      readSettings();
-      saveStatus.textContent = `${learned.size}字を登録しました。` +
-        (parsed.rejected.size ? ' 対象外：' + [...parsed.rejected].join('') : '');
-    } catch {
-      saveStatus.textContent = '保存できませんでした。もう一度お試しください。';
-    } finally {
-      save.disabled = editor.disabled = false;
-    }
-  };
-  forgetEditor.oninput = () => { forgetStatus.textContent = ''; };
-  forget.onclick = async () => {
-    if (!forgetEditor.value.trim()) {
-      forgetStatus.textContent = '移す字を入力してください。';
-      return;
-    }
-    const { move, already, unlearned, outside } = classifyForgetInput(forgetEditor.value, GM_getValues());
-    forget.disabled = forgetEditor.disabled = true;
-    try {
-      await writeCharacterStates(Object.fromEntries(move.map(char => ['known:' + char, 'forgotten'])));
-      const messages = [move.length ? `移した字（${move.length}字）：${move.join('')}` : '移した字はありません。'];
-      if (already.length) messages.push('すでに忘れた字：' + already.join(''));
-      if (unlearned.length) messages.push('習得済みにない字：' + unlearned.join(''));
-      if (outside.length) messages.push('TUT-Code対象外：' + outside.join(''));
-      forgetStatus.textContent = messages.join('　');
-      if (move.length) forgetEditor.value = '';
-    } catch {
-      forgetStatus.textContent = '保存できませんでした。もう一度お試しください。';
-    } finally {
-      forget.disabled = forgetEditor.disabled = false;
-    }
-  };
-  // Only the latest click may adjust the panel after an asynchronous save.
-  let pendingPosition = null;
-  function cancelPosition() { pendingPosition = null; }
-  panel.addEventListener('wheel', cancelPosition, { passive: true });
-  document.addEventListener('keydown', cancelPosition, true);
-  document.addEventListener('pointerdown', cancelPosition, true);
-
-  panel.addEventListener('click', async event => {
-    const button = event.target.closest('button[data-char]');
-    if (!button) return;
-    const feedback = forgottenList.contains(button) ? forgetStatus : copyStatus;
-    const char = button.dataset.char;
-    const row = button.closest('li');
-    const list = row.parentElement;
-    const next = (row.nextElementSibling || row.previousElementSibling)?.querySelector('button');
-    const position = next && button.getBoundingClientRect().height
-      ? { listTop: list.getBoundingClientRect().top, top: button.getBoundingClientRect().top } : null;
-    pendingPosition = position;
-    button.disabled = true;
-    try {
-      await writeCharacterStates({ ['known:' + char]: true });
-      if (feedback === forgetStatus) feedback.textContent = char + 'を習得済みに戻しました。';
-      if (position && position === pendingPosition && active && expanded) {
-        // Include the resized word list and save feedback in the final layout.
-        refresh();
-        if (next.isConnected && next.getBoundingClientRect().height) {
-          panel.scrollTop += list.getBoundingClientRect().top - position.listTop;
-          const listBox = list.getBoundingClientRect();
-          const nextBox = next.getBoundingClientRect();
-          const topInList = Math.max(listBox.top, Math.min(position.top, listBox.bottom - nextBox.height));
-          list.scrollTop += nextBox.top - topInList;
-          panel.scrollTop += next.getBoundingClientRect().top - position.top;
-        }
-      }
-    } catch {
-      feedback.textContent = '登録できませんでした。もう一度お試しください。';
-    } finally {
-      button.disabled = false;
-      if (pendingPosition === position) cancelPosition();
-    }
-  });
-  copy.onclick = async () => {
-    if (!active) return;
-    refresh();
-    if (!clipboardText) return;
-    try {
-      await GM.setClipboard(clipboardText, 'text');
-      copyStatus.textContent = 'コピーしました。';
-    } catch {
-      copyStatus.textContent = 'コピーできませんでした。もう一度お試しください。';
-    }
-  };
-
-  function characterRow(char, kind) {
-    const row = el('li');
-    row.dataset.char = char;
-    row.append(el('span'));
-    if (kind !== 'outside') {
-      const restoring = kind === 'forgotten';
-      const button = el('button', restoring ? '習得済みに戻す' : '習得済みにする');
-      button.dataset.char = char;
-      button.setAttribute('aria-label', char + 'を' + button.textContent);
-      row.append(button);
-    }
-    return row;
-  }
-
-  function updateCharacterRows(list, kind, counts) {
-    const rows = new Map();
-    for (const row of [...list.children]) {
-      const char = row.dataset.char;
-      if (counts.has(char)) rows.set(char, row);
-      else row.remove();
-    }
-    let next = list.firstElementChild;
-    for (const [char, count] of counts) {
-      const row = rows.get(char) || characterRow(char, kind);
-      const label = count === undefined ? char : `${char}　${count}回`;
-      if (row.firstElementChild.textContent !== label) row.firstElementChild.textContent = label;
-      if (row !== next) list.insertBefore(row, next);
-      next = row.nextElementSibling;
-    }
-  }
-
-  function render(result, selected) {
-    const { counts, words, characters } = result;
-    const inside = counts.learned + counts.missing;
-    const total = inside + counts.outside;
-    toggle.textContent = '現在 ' + percentage(counts.learned, total);
-    toggle.title = toggle.textContent + ' ｜ 全習得時 ' + percentage(inside, total);
-    if (!expanded) return;
-    scope.textContent = selected ? '選択範囲' : 'ページ全体';
-    const ratios = [[counts.learned, total], [inside, total], [counts.learned, inside]];
-    ratios.forEach(([num, den], index) => {
-      metricValues[index].textContent = `${percentage(num, den)}（${num}/${den}字）`;
-    });
-    totals.textContent = `習得済み ${counts.learned}字 ｜ 未習得 ${counts.missing}字 ｜ 外字 ${counts.outside}字`;
-    clipboardText = practiceText(words, includeOutside.input.checked);
-    copy.disabled = !clipboardText;
-    copyStatus.textContent = '';
-    wordList.replaceChildren(...words.map(({ word, missing, outside, count }) => {
-      const row = el('li');
-      const name = el('span', word, 'word');
-      name.append(el('span', missing.join('・') + (outside ? ' ／ 外字あり' : ''), 'note'));
-      row.append(name, el('span', count + '回', 'quantity'));
-      return row;
-    }));
-    if (!words.length) wordList.append(el('li', '練習候補はありません。'));
-    const groups = { forgotten: new Map(), missing: new Map(), outside: new Map() };
-    for (const { char, kind, count } of characters) {
-      groups[forgotten.has(char) ? 'forgotten' : kind].set(char, count);
-    }
-    for (const [kind, counts] of Object.entries(groups)) {
-      const list = charGroups[kind];
-      updateCharacterRows(list, kind, counts);
-      list.previousElementSibling.hidden = list.hidden = !counts.size;
-    }
   }
 
   function pageSelection() {
@@ -709,120 +548,479 @@ SUCH DAMAGE.
       (boundary ? '\n' : '') + node.data.slice(start, end)).join('');
   }
 
-  function cachedAnalysis(cache, text) {
-    if (!cache.result || cache.text !== text) {
-      cache.result = analyze(text, learned);
-      cache.text = text;
-    }
-    return cache.result;
+  const history = historyStore(GM);
+  const policyKey = 'historyPolicy';
+  const readPolicy = () => GM_getValues([policyKey])[policyKey] || { mode: 'off', hosts: [] };
+  const readHighlightSetting = () => GM_getValues(['decorate']).decorate !== false;
+  let highlightEnabled = readHighlightSetting();
+  let host, dialog;
+  let refreshSettings, refreshHistory, refreshHistoryCharacters;
+  function el(tag, text) {
+    const node = document.createElement(tag);
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+  function field(label, input) {
+    const node = el('label', label);
+    node.append(input);
+    return node;
+  }
+  function button(label, handler, status, available = () => true) {
+    const node = el('button', label);
+    node.type = 'button';
+    node.disabled = !available();
+    node.onclick = async () => {
+      node.disabled = true;
+      try { await handler(); }
+      catch { if (status) status.textContent = '操作に失敗しました。もう一度お試しください。'; }
+      finally { node.disabled = !available(); }
+    };
+    return node;
   }
 
-  function refreshMarks() {
-    clearTimeout(marksTimer);
-    if (active && document.body && decorate.input.checked) mark(collect(markedSelection, true), learned);
-    else clearMarks();
+  function closePanel(resume = true) {
+    if (dialog?.open) dialog.close();
+    host?.remove();
+    host = dialog = refreshSettings = refreshHistory = refreshHistoryCharacters = null;
+    if (resume) updateActivity();
   }
 
-  function refresh() {
-    clearTimeout(refreshTimer);
-    refreshTimer = undefined;
-    if (!active || !document.body) return;
-    const range = interacting ? savedSelection : pageSelection();
-    const selection = range && !range.collapsed && range.commonAncestorContainer.isConnected ? collect(range) : [];
-    markedSelection = selection.length ? range : null;
-    let result;
-    if (markedSelection) {
-      result = cachedAnalysis(selectionCache, textOf(selection));
-    } else {
-      result = cachedAnalysis(pageCache, pageDirty ? textOf(collect()) : pageCache.text);
-      pageDirty = false;
-    }
-    if (result !== renderedResult) {
-      render(result, Boolean(markedSelection));
-      renderedResult = result;
-    }
-    refreshMarks();
-    if (!host.isConnected) document.documentElement.append(host);
-  }
-  function schedule(delay = 120) {
-    clearTimeout(refreshTimer);
-    if (active) refreshTimer = setTimeout(refresh, delay);
+  function openPanel(title) {
+    closePanel(false);
+    host = el('div');
+    host.id = 'tut-code-meter';
+    const shadow = host.attachShadow({ mode: 'closed' });
+    const style = new CSSStyleSheet();
+    style.replaceSync(`
+      :host { all: initial !important; }
+      dialog { color-scheme: light dark; box-sizing: border-box; width: min(42rem, 94vw);
+        max-height: 84vh; margin: auto; padding: 0; border: 1px solid GrayText; border-radius: .6rem;
+        background: Canvas; color: CanvasText; font: 15px/1.55 system-ui,sans-serif; text-align: start; }
+      dialog::backdrop { background: rgb(0 0 0 / .36); }
+      header, .actions { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }
+      header { position: sticky; top: 0; z-index: 1; background: Canvas; justify-content: space-between;
+        padding: .7rem 1.2rem; border-bottom: 1px solid GrayText; }
+      section { padding: 0 1.2rem 1.2rem; } h1 { font-size: 1.15rem; margin: 0; }
+      h2 { font-size: 1.05rem; margin: 1.2rem 0 .4rem; }
+      p { margin: .6rem 0; } label { display: block; margin: .7rem 0; }
+      input, select, textarea, button { font: inherit; } input, textarea, select { display: block; }
+      .highlight-option { display: flex; gap: .4rem; align-items: center; }
+      textarea { box-sizing: border-box; width: 100%; min-height: 4em; } button { cursor: pointer; }
+      button:disabled { cursor: default; } pre { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+      .period-summary { max-height: 40vh; overflow: auto; }
+      article { border-top: 1px solid GrayText; margin-top: .75rem; }
+      [role=status]:empty { display: none; } ul { padding: 0; list-style: none; }
+      li { display: flex; align-items: center; justify-content: space-between; padding: .15rem 0; }
+      li[hidden] { display: none; }
+    `);
+    shadow.adoptedStyleSheets = [style];
+    dialog = el('dialog');
+    dialog.setAttribute('aria-label', title);
+    const header = el('header');
+    header.append(el('h1', title), button('閉じる', closePanel));
+    const section = el('section');
+    dialog.append(header, section);
+    shadow.append(dialog);
+    document.documentElement.append(host);
+    dialog.addEventListener('cancel', event => { event.preventDefault(); closePanel(); });
+    dialog.showModal();
+    syncHighlights();
+    return section;
   }
 
-  // Keep the article selection while the user moves focus into the panel.
-  function trackInteraction(event) {
-    const inside = event.composedPath().includes(host);
-    if (inside && !interacting) savedSelection = pageSelection();
-    if (!inside) savedSelection = null;
-    interacting = inside;
-    if (!inside) schedule(0);
-  }
-  document.addEventListener('pointerdown', trackInteraction, true);
-  document.addEventListener('focusin', trackInteraction, true);
-  document.addEventListener('selectionchange', () => {
-    if (interacting) {
-      // Keyboard and programmatic article selections can arrive while a
-      // panel control still has focus. A panel-only change keeps the snapshot.
-      const range = pageSelection();
-      if (!range || !document.body?.contains(range.commonAncestorContainer)) return;
-      savedSelection = range;
+  function openSettings() {
+    const section = openPanel('学習設定');
+    const status = el('p');
+    status.setAttribute('role', 'status');
+    const policy = readPolicy();
+    const mode = el('select');
+    for (const [value, name] of [['off', '記録しない'], ['allow', '許可したサイトだけ記録'], ['exclude', '除外したサイト以外を記録']]) {
+      const option = el('option', name);
+      option.value = value;
+      mode.append(option);
     }
-    schedule(0);
+    mode.value = policy.mode;
+    const hosts = el('textarea');
+    hosts.value = policy.hosts.join('\n');
+    hosts.placeholder = 'example.com';
+    const savePolicy = button('記録設定を保存', async () => {
+      let normalized;
+      try { normalized = parseHosts(hosts.value); } catch {
+        status.textContent = 'サイトはホスト名で入力してください（例：example.com）。'; return;
+      }
+      await GM.setValue(policyKey, { mode: mode.value, hosts: normalized });
+      hosts.value = normalized.join('\n');
+      status.textContent = '記録設定を保存しました。';
+    }, status);
+    section.append(el('h2', '閲覧の自動記録'),
+      el('p', '閲覧日時、サイト名、タイトル、URL（クエリを含む）、3つのカバー率と字数、打てなかった字を含む語と回数、その時点の忘れた字・外字を保存します。'),
+      el('p', '記録はTampermonkey内に、自分で削除するまで残ります。本文全文の保存や外部送信は行いません。シークレットとMeet休止中は記録しません。'),
+      field('記録するサイト', mode), el('p', '「除外したサイト以外を記録」でホスト名を空欄にすると、すべてのサイトが対象になります。'),
+      field('ホスト名（1行に1件、サブドメインは個別に指定）', hosts), savePolicy, status);
+
+    const decorate = el('input');
+    decorate.type = 'checkbox';
+    decorate.checked = highlightEnabled;
+    decorate.onchange = async () => {
+      decorate.disabled = true;
+      try { await GM.setValue('decorate', decorate.checked); }
+      catch {
+        decorate.checked = readHighlightSetting();
+        status.textContent = 'ハイライト設定を保存できませんでした。';
+      } finally { decorate.disabled = false; }
+    };
+    const highlightLabel = el('label');
+    highlightLabel.className = 'highlight-option';
+    highlightLabel.append(decorate, '本文の未習得字と外字をハイライト');
+    section.append(highlightLabel);
+
+    const editor = el('textarea');
+    const learnedLabel = el('label');
+    const learnedLabelText = document.createTextNode('');
+    learnedLabel.append(learnedLabelText, editor);
+    const forget = el('textarea');
+    const result = el('p');
+    result.setAttribute('role', 'status');
+    const count = el('h2');
+    const list = el('ul');
+    let baseline = new Set();
+    let dirty = false;
+    editor.oninput = () => { dirty = true; };
+    const write = async changes => {
+      if (Object.keys(changes).length) await GM.setValues({ ...changes, learnedRevision: nonce() });
+    };
+    const update = () => {
+      decorate.checked = highlightEnabled;
+      const states = GM_getValues(profileKeys);
+      const learned = [...target].filter(c => states['known:' + c] === true);
+      learnedLabelText.data = `習得済みの漢字 (${learned.length}文字/${target.size}文字)`;
+      const forgotten = [...target].filter(c => states['known:' + c] === 'forgotten');
+      if (!dirty) {
+        editor.value = learned.join('');
+        baseline = new Set(learned);
+      } else {
+        const moved = new Set(forgotten.filter(c => baseline.delete(c)));
+        if (moved.size) editor.value = [...editor.value].filter(c => !moved.has(c)).join('');
+      }
+      count.textContent = '忘れた字の一覧（' + forgotten.length + '字）';
+      const rows = new Map([...list.children].map(row => [row.dataset.char, row]));
+      let next = list.firstElementChild;
+      for (const char of forgotten) {
+        let row = rows.get(char);
+        if (row) rows.delete(char);
+        else {
+          row = el('li');
+          row.dataset.char = char;
+          const restore = button('習得済みに戻す', async () => {
+            const sibling = row.nextElementSibling || row.previousElementSibling;
+            const top = row.getBoundingClientRect().top;
+            await write({ ['known:' + char]: true });
+            update();
+            if (sibling?.isConnected) {
+              sibling.querySelector('button').focus({ preventScroll: true });
+              dialog.scrollTop += sibling.getBoundingClientRect().top - top;
+            }
+          }, result);
+          restore.setAttribute('aria-label', char + 'を習得済みに戻す');
+          row.append(el('span', char), restore);
+        }
+        if (row !== next) list.insertBefore(row, next);
+        next = row.nextElementSibling;
+      }
+      for (const row of rows.values()) row.remove();
+    };
+    const save = button('習得済み字を保存', async () => {
+      const states = GM_getValues(profileKeys);
+      const parsed = parseLearned(editor.value);
+      const changes = {};
+      for (const c of baseline) if (!parsed.learned.has(c) && states['known:' + c] === true) changes['known:' + c] = false;
+      for (const c of parsed.learned) if (!baseline.has(c)) changes['known:' + c] = true;
+      await write(changes);
+      dirty = false;
+      update();
+      result.textContent = baseline.size + '字を登録しました。' + (parsed.rejected.size ? ' 対象外：' + [...parsed.rejected].join('') : '');
+    }, result);
+    const move = button('忘れた字に移す', async () => {
+      if (!forget.value.trim()) { result.textContent = '移す字を入力してください。'; return; }
+      const { move, already, unlearned, outside } = classifyForgetInput(forget.value, GM_getValues(profileKeys));
+      await write(Object.fromEntries(move.map(c => ['known:' + c, 'forgotten'])));
+      update();
+      result.textContent = [
+        move.length ? '移した字：' + move.join('') : '移した字はありません。',
+        already.length && 'すでに忘れた字：' + already.join(''), unlearned.length && '習得済みにない字：' + unlearned.join(''),
+        outside.length && 'TUT-Code対象外：' + outside.join(''),
+      ].filter(Boolean).join('　');
+      if (move.length) forget.value = '';
+    }, result);
+    section.append(el('h2', '習得状態'), learnedLabel, save,
+      field('忘れた字', forget), move, result, count, list);
+    refreshSettings = update;
+    update();
+  }
+
+  function openHistory() {
+    const section = openPanel('学習履歴');
+    const start = el('input'), end = el('input');
+    start.type = end.type = 'date';
+    start.value = end.value = localDay(new Date());
+    const filters = el('div');
+    filters.className = 'actions';
+    filters.append(field('開始日', start), field('終了日', end));
+    const status = el('p'), confirmation = el('div'), results = el('div');
+    status.setAttribute('role', 'status');
+    let revision = 0;
+    async function copy(text) {
+      const request = revision;
+      try {
+        await GM.setClipboard(text, 'text');
+        if (request === revision) status.textContent = 'コピーしました。';
+      } catch {
+        if (request === revision) status.textContent = 'コピーに失敗しました。もう一度お試しください。';
+      }
+    }
+    let report;
+    function learningList(records) {
+      const group = el('details');
+      group.className = 'history-characters';
+      group.append(el('summary', '習得していない漢字'));
+      const list = el('ul');
+      group.append(list, el('p', '登録できる未習得字はありません。'));
+      for (const [char, count] of rankMissingCharacters(records)) {
+        const row = el('li');
+        row.dataset.char = char;
+        const learn = button('習得済みにする', async () => {
+          const panel = dialog;
+          const visible = [...list.children].filter(item => !item.hidden);
+          const index = visible.indexOf(row);
+          const neighbor = visible[index + 1] || visible[index - 1];
+          const top = row.getBoundingClientRect().top;
+          await GM.setValues({ ['known:' + char]: true, learnedRevision: nonce() });
+          refreshHistoryCharacters?.();
+          if (dialog === panel && neighbor?.isConnected && !neighbor.hidden && group.open) {
+            panel.scrollTop += neighbor.getBoundingClientRect().top - top;
+          }
+        }, status);
+        learn.setAttribute('aria-label', char + 'を習得済みにする');
+        row.append(el('span', char + '　' + count + '回'), learn);
+        list.append(row);
+      }
+      return group;
+    }
+    refreshHistoryCharacters = () => {
+      const states = GM_getValues(profileKeys);
+      for (const group of results.querySelectorAll('.history-characters')) {
+        let remaining = 0;
+        for (const row of group.querySelectorAll('li')) {
+          row.hidden = states['known:' + row.dataset.char] === true;
+          if (!row.hidden) remaining++;
+        }
+        group.firstElementChild.textContent = '習得していない漢字（' + remaining + '字）';
+        group.lastElementChild.hidden = remaining > 0;
+      }
+    };
+    const copyRange = button('この期間の記録をコピー', () => copy(report.text), status, () => Boolean(report));
+    function wordCopyButton(getText, includeOutside) {
+      const label = includeOutside ? '未知語をコピー(外字含む)' : '未知語をコピー';
+      return button(label, () => copy(getText()), status, () => Boolean(getText()));
+    }
+    const copyWords = wordCopyButton(() => report?.tutWordText, false);
+    const copyWordsWithOutside = wordCopyButton(() => report?.wordText, true);
+    function confirmDelete(scope, message) {
+      confirmation.replaceChildren(el('p', message), button('削除する', async () => {
+        await history.remove(scope);
+        await GM.setValue('historyRevision', nonce());
+        await load();
+        status.textContent = '削除しました。';
+      }, status), button('キャンセル', () => confirmation.replaceChildren()));
+      confirmation.querySelector('button').focus();
+    }
+    const removeAll = button('全件を削除', () => confirmDelete({}, '指定期間の外も含め、すべての学習履歴を削除しますか？'));
+    const actions = el('div');
+    actions.className = 'actions';
+    actions.append(copyRange, copyWords, copyWordsWithOutside, removeAll);
+    section.append(filters, actions, confirmation, status, results);
+
+    async function load() {
+      const request = ++revision;
+      const from = start.value, to = end.value;
+      confirmation.replaceChildren();
+      copyRange.disabled = copyWords.disabled = copyWordsWithOutside.disabled = true;
+      report = undefined;
+      results.replaceChildren();
+      if (from && to && from > to) {
+        status.textContent = '終了日は開始日以降を指定してください。'; return;
+      }
+      status.textContent = '';
+      try {
+        const found = await history.list(from, to);
+        if (revision !== request || !section.isConnected) return;
+        if (!found.length) {
+          results.append(el('p', 'この期間の記録はありません。'));
+          return;
+        }
+        report = summarizePeriod(found, from, to);
+        copyRange.disabled = false;
+        copyWords.disabled = !report.tutWordText;
+        copyWordsWithOutside.disabled = !report.wordText;
+        const summaryText = el('pre', report.text);
+        summaryText.className = 'period-summary';
+        results.append(el('h2', '期間集計'), summaryText, learningList(found), el('h2', '記事別の記録'));
+        for (const record of found) {
+          const article = el('article');
+          const detail = el('details');
+          const summary = el('summary', record.day + ' ' + record.time + '　' + record.title);
+          const tools = el('div');
+          tools.className = 'actions';
+          tools.append(button('この記事の記録をコピー', () => copy(recordText(record)), status),
+            wordCopyButton(() => practiceText(record.words, false), false),
+            wordCopyButton(() => practiceText(record.words, true), true),
+            button('この記事の記録を削除', () => confirmDelete({ day: record.day, url: record.url }, 'この記事の' + record.day + 'の記録を削除しますか？')),
+            button('このサイトの記録を削除', () => confirmDelete({ host: record.host }, record.host + ' の全期間の記録を削除しますか？')));
+          detail.append(summary, el('pre', recordText(record)), tools, learningList([record]));
+          article.append(detail);
+          results.append(article);
+        }
+        refreshHistoryCharacters();
+      } catch { if (revision === request) status.textContent = '履歴を読み込めませんでした。'; }
+    }
+    start.oninput = end.oninput = load;
+    refreshHistory = load;
+    load();
+  }
+
+  let meetingClear, suspended = false;
+  let url = location.href;
+  let started = Math.floor(performance.timeOrigin);
+  let reload = performance.getEntriesByType('navigation')[0]?.type === 'reload';
+  let visitReady = false, focusedDay = '', capturing = false, waitingForBody = false;
+  const pending = new Map(); // Keep the latest focus and learning state for each local day.
+  const bodyChanges = { subtree: true, childList: true, characterData: true, attributes: true,
+    attributeFilter: ['class', 'style', 'hidden', 'aria-hidden', 'open', 'role', 'contenteditable'] };
+  let bodyTimer;
+  const observer = new MutationObserver(() => {
+    if (!bodyTimer) bodyTimer = setTimeout(bodyChanged, 100);
   });
-  document.addEventListener('scroll', () => {
-    if (!active || !decorate.input.checked) return;
-    clearTimeout(marksTimer);
-    marksTimer = setTimeout(refreshMarks, 120);
-  }, true);
 
-  function invalidatePage() {
-    pageDirty = true;
-    if (!refreshTimer) schedule();
+  const isForeground = () => document.visibilityState === 'visible' && document.hasFocus();
+  const siteAllowed = () => !suspended && url === location.href && !isMeeting(location) && permits(readPolicy(), location.hostname);
+
+  let highlighting = false, highlightTimer, highlightStates;
+  const highlightObserver = new MutationObserver(scheduleHighlights);
+  function scheduleHighlights() {
+    if (!highlighting || highlightTimer) return;
+    highlightTimer = setTimeout(() => {
+      highlightTimer = undefined;
+      if (!highlighting) return;
+      highlightStates ??= GM_getValues(profileKeys);
+      mark(collect(pageSelection(), true), highlightStates);
+    }, 80);
   }
-  window.addEventListener('resize', invalidatePage);
-  window.addEventListener('load', invalidatePage);
-  document.addEventListener('DOMContentLoaded', invalidatePage);
-  document.fonts?.addEventListener('loadingdone', invalidatePage);
-
-  const observer = new MutationObserver(records => {
-    // Coalesce a continuously changing page without postponing a pending read.
-    if (records.some(r => r.type !== 'childList' || r.removedNodes.length
-      || [...r.addedNodes].some(node => node !== host))) invalidatePage();
-  });
-  function allowDisplay(allowed) {
-    if (active === allowed) return;
-    active = allowed;
-    if (active) {
-      observer.observe(document, {
-        childList: true, subtree: true, characterData: true, attributes: true,
-        attributeFilter: ['class', 'style', 'hidden', 'aria-hidden', 'open', 'role', 'contenteditable'],
-      });
-      readSettings();
+  function syncHighlights() {
+    const enabled = Boolean(meetingClear && highlightEnabled && !host && document.visibilityState === 'visible' && siteAllowed());
+    if (enabled === highlighting) return;
+    highlighting = enabled;
+    if (enabled) {
+      highlightObserver.observe(document, bodyChanges);
+      scheduleHighlights();
     } else {
-      cancelPosition();
-      clearTimeout(refreshTimer);
-      clearTimeout(marksTimer);
-      refreshTimer = undefined;
-      observer.disconnect();
-      host.remove();
+      highlightObserver.disconnect();
+      clearTimeout(highlightTimer);
+      highlightTimer = highlightStates = undefined;
       clearMarks();
-      clipboardText = '';
-      pageDirty = true;
-      pageCache = {};
-      selectionCache = {};
-      renderedResult = markedSelection = savedSelection = null;
-      interacting = false;
     }
   }
 
-  // The live tab registry owns membership. The shared value is only a
-  // wake-up signal, so two simultaneous meetings cannot overwrite each other.
-  let registered;
-  let checking = false;
-  let revision = 0;
+  // Latch focus synchronously, even if Meet/tab registration or the article DOM
+  // hasn't arrived yet. Losing focus alone cannot cancel a qualified visit.
+  function rememberFocus() {
+    if (focusedDay || meetingClear === false || host || !isForeground() || !siteAllowed()) return;
+    const date = new Date();
+    focusedDay = localDay(date);
+    pending.set(focusedDay, { date, states: GM_getValues(profileKeys) });
+  }
+  function stopWatchingBody() {
+    observer.disconnect();
+    clearTimeout(bodyTimer);
+    bodyTimer = undefined;
+    waitingForBody = false;
+  }
+  function bodyChanged() {
+    stopWatchingBody();
+    capturePending();
+  }
+  function cancelVisit() {
+    stopWatchingBody();
+    pending.clear();
+    focusedDay = '';
+  }
+  function updateActivity() {
+    rememberFocus();
+    syncHighlights();
+    capturePending();
+  }
+  async function capturePending() {
+    if (!pending.size || capturing || waitingForBody || !visitReady || !meetingClear || !siteAllowed()) return;
+    const [day, visit] = pending.entries().next().value;
+    const eligible = () => pending.get(day) === visit && visitReady && meetingClear && siteAllowed();
+    capturing = true;
+    try {
+      if (await history.blocked(day, url, started)) {
+        if (eligible()) pending.delete(day);
+        return;
+      }
+      if (!eligible()) return;
+      const text = document.readyState !== 'loading' && textOf(collect());
+      if (!text || !kanji.test(text)) {
+        waitingForBody = true;
+        observer.observe(document, bodyChanges);
+        return;
+      }
+      const tabs = await GM.getTabs();
+      if (Object.values(tabs).some(tab => tab.tutCodeMeeting)) { setMeetingClear(false); return; }
+      if (!eligible()) return;
+      const record = snapshot(text, visit.states, {
+        url, host: hostnameOf(url), title: document.title || location.hostname,
+        siteName: document.querySelector('meta[property="og:site_name"]')?.content.trim() || location.hostname,
+      }, visit.date);
+      await history.save(record, started, eligible);
+      if (eligible()) {
+        pending.delete(day);
+        await GM.setValue('historyRevision', nonce());
+      }
+    } catch {
+      // Leave the visit pending for the next registry poll if storage is unavailable.
+    } finally {
+      capturing = false;
+      if (pending.get(day) !== visit) capturePending();
+    }
+  }
+  function setMeetingClear(clear) {
+    meetingClear = clear;
+    if (!clear) {
+      cancelVisit();
+      if (host) closePanel(false);
+    }
+    updateActivity();
+  }
+  function newVisit() {
+    url = location.href;
+    started = Date.now();
+    reload = false;
+    visitReady = false;
+    cancelVisit();
+    if (host) closePanel(false);
+    // A SPA can change articles without a visibility or focus event.
+    scheduleHighlights();
+  }
+
+  // Keep the existing cross-tab Meet registry. A reload inherits the start of
+  // the visit so that an open tab cannot repopulate a manually deleted record.
+  let registered, checking = false, revision = 0;
   async function checkMeetings(conceal = false) {
+    if (url !== location.href) newVisit();
     revision++;
-    if (conceal || isMeeting(location)) allowDisplay(false);
+    if (conceal || isMeeting(location)) setMeetingClear(false);
+    rememberFocus();
     if (checking || suspended) return;
     checking = true;
     try {
@@ -830,46 +1028,87 @@ SUCH DAMAGE.
       do {
         checked = revision;
         const meeting = isMeeting(location);
-        if (registered !== meeting) {
+        const trackVisit = !visitReady && permits(readPolicy(), location.hostname);
+        if (registered !== meeting || trackVisit) {
           const tab = await GM.getTab();
           if (suspended || checked !== revision) continue;
-          if (Boolean(tab.tutCodeMeeting) !== meeting) {
-            tab.tutCodeMeeting = meeting;
-            await GM.saveTab(tab);
-            await GM.setValue('meetRevision', nonce());
+          const changed = Boolean(tab.tutCodeMeeting) !== meeting;
+          if (changed) tab.tutCodeMeeting = meeting;
+          if (trackVisit) {
+            const route = scopeId(url);
+            if (reload && tab.tutCodeVisit?.route === route) started = tab.tutCodeVisit.started;
+            tab.tutCodeVisit = { route, started };
           }
+          if (changed || trackVisit) await GM.saveTab(tab);
+          if (changed) await GM.setValue('meetRevision', nonce());
+          if (suspended || checked !== revision) continue;
           registered = meeting;
+          if (trackVisit) visitReady = true;
         }
         const tabs = await GM.getTabs();
-        if (!suspended && checked === revision) {
-          allowDisplay(!meeting && !Object.values(tabs).some(tab => tab.tutCodeMeeting));
-        }
+        if (!suspended && checked === revision) setMeetingClear(!meeting && !Object.values(tabs).some(tab => tab.tutCodeMeeting));
       } while (!suspended && checked !== revision);
     } catch {
-      // Retry on the next poll. Keep the screen clear while state is unknown.
       registered = undefined;
-      allowDisplay(false);
-    } finally {
-      checking = false;
-    }
+      setMeetingClear(false);
+    } finally { checking = false; }
   }
 
-  GM_addValueChangeListener('meetRevision', () => checkMeetings(true));
-  for (const event of ['urlchange', 'popstate']) {
-    window.addEventListener(event, () => checkMeetings(true));
+  async function fromMenu(open) {
+    try {
+      const tabs = await GM.getTabs();
+      if (!suspended && !isMeeting(location) && !Object.values(tabs).some(tab => tab.tutCodeMeeting)) open();
+    } catch { /* Keep history concealed if the meeting state is unavailable. */ }
   }
+  GM_registerMenuCommand('学習履歴を開く', () => fromMenu(openHistory));
+  GM_registerMenuCommand('学習設定を開く', () => fromMenu(openSettings));
+  GM_addValueChangeListener(policyKey, () => {
+    if (!siteAllowed()) cancelVisit();
+    syncHighlights();
+    checkMeetings();
+  });
+  GM_addValueChangeListener('decorate', () => {
+    highlightEnabled = readHighlightSetting();
+    syncHighlights();
+    refreshSettings?.();
+  });
+  GM_addValueChangeListener('learnedRevision', () => {
+    highlightStates = undefined;
+    scheduleHighlights();
+    refreshSettings?.();
+    refreshHistoryCharacters?.();
+  });
+  document.addEventListener('scroll', scheduleHighlights, true);
+  document.addEventListener('selectionchange', scheduleHighlights);
+  window.addEventListener('resize', scheduleHighlights);
+  document.fonts?.addEventListener('loadingdone', scheduleHighlights);
+  GM_addValueChangeListener('historyRevision', () => refreshHistory?.());
+  GM_addValueChangeListener('meetRevision', () => checkMeetings(true));
+  for (const event of ['urlchange', 'popstate', 'hashchange']) window.addEventListener(event, () => checkMeetings());
   window.addEventListener('pagehide', () => {
     suspended = true;
     revision++;
-    allowDisplay(false);
+    setMeetingClear(false);
   });
-  window.addEventListener('pageshow', () => {
+  window.addEventListener('pageshow', event => {
+    if (event.persisted) newVisit();
     suspended = false;
-    registered = undefined; // Another document may have occupied this tab.
-    checkMeetings(true);
+    registered = undefined;
+    checkMeetings();
   });
-  document.addEventListener('visibilitychange', () => checkMeetings(true));
-  window.addEventListener('focus', () => checkMeetings());
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible' && !host) focusedDay = '';
+    syncHighlights();
+    checkMeetings();
+  });
+  function checkWaitingBody() { if (waitingForBody) bodyChanged(); }
+  document.addEventListener('DOMContentLoaded', checkWaitingBody);
+  window.addEventListener('load', checkWaitingBody);
+  window.addEventListener('resize', checkWaitingBody);
+  window.addEventListener('focus', () => {
+    if (focusedDay !== localDay(new Date())) focusedDay = '';
+    checkMeetings();
+  });
   setInterval(() => checkMeetings(), 2500);
   checkMeetings();
 })();
