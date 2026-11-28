@@ -63,6 +63,10 @@
   }
   function openMenu(text) { return menus.get(text)(); }
   function closePanelForTest() { click('閉じる'); }
+  function forgetCharacter(char) {
+    panel.querySelectorAll('textarea')[2].value = char;
+    click('忘れた字に移す');
+  }
   function highlightChecked() { return panel.querySelector('[type=checkbox]').checked; }
   function focusPage(state) { foreground = state; window.dispatchEvent(new Event(state ? 'focus' : 'blur')); }
   const quiet = () => !document.querySelector('#tut-code-meter') && !CSS.highlights.size;
@@ -121,7 +125,7 @@
     await GM.setValue('historyPolicy', { mode: 'allow', hosts: ['other.test'] });
     await pause(150); assert(!records().length && quiet(), '許可外では記録・装飾とも休止');
     await openMenu('学習設定を開く');
-    const [hosts, learned, forgotten] = panel.querySelectorAll('textarea');
+    const [hosts, learned] = panel.querySelectorAll('textarea');
     const learnedCount = count => learned.labels[0].textContent === '習得済みの漢字 (' + count + '文字/2525文字)';
     assert([...learned.value].sort().join('') === [...'設計築成語'].sort().join(''), '既存習得字');
     assert(learnedCount(5), '設定を開いた時点の習得済み字数');
@@ -130,8 +134,7 @@
     assert(learnedCount(5), '未保存の入力は習得済み字数に含めない');
     click('習得済み字を保存');
     await until(() => learnedCount(6));
-    forgotten.value = '構';
-    click('忘れた字に移す');
+    forgetCharacter('構');
     await until(() => learnedCount(5));
     panel.querySelector('select').value = 'exclude'; hosts.value = 'other.test';
     click('記録設定を保存');
@@ -247,6 +250,15 @@
     const articleCount = () => panel.querySelectorAll('article').length;
     const report = () => panel.querySelector('pre')?.textContent;
     const action = (name, root = panel) => [...root.querySelectorAll('button')].find(b => b.textContent === name);
+    const pastWords = '当時の未知語をコピー', currentWords = '今も未知の語をコピー';
+    const pastWithOutside = pastWords + '(外字含む)', currentWithOutside = currentWords + '(外字含む)';
+    function assertCopy(root, label, expected) {
+      const control = action(label, root);
+      assert(!control.disabled, label + 'が有効');
+      clipboard = '';
+      control.click();
+      assert(clipboard === expected, label + 'の内容：' + clipboard);
+    }
     function setPeriod(from, to) {
       const [start, end] = panel.querySelectorAll('input[type=date]');
       start.value = from; end.value = to; end.dispatchEvent(new Event('input'));
@@ -264,8 +276,8 @@
     click('この期間の記録をコピー');
     assert(clipboard === report() && clipboard.includes('記事件数　2件') && clipboard.includes('72.7%（16/22字）') &&
       clipboard.endsWith('未知語\n構築　2回\n構成　1回'), '期間画面とコピーには外字を含まない語だけ表示');
-    click('未知語をコピー'); assert(clipboard === '構築\n構成', '期間の単語コピーから外字を含む語を除く');
-    click('未知語をコピー(外字含む)'); assert(clipboard === '語彙\n構築\n構成', '期間の単語コピーに外字を含む語も入れる');
+    click(pastWords); assert(clipboard === '構築\n構成', '期間の単語コピーから外字を含む語を除く');
+    click(pastWithOutside); assert(clipboard === '語彙\n構築\n構成', '期間の単語コピーに外字を含む語も入れる');
     const match = [...panel.querySelectorAll('article')].find(a => a.querySelector('pre').textContent.includes(first.url));
     match.querySelector('details').open = true;
     assert(match.querySelector('summary + .actions + .history-characters + pre') === match.querySelector('pre'),
@@ -273,9 +285,9 @@
     assert(!match.querySelector('pre').textContent.includes('語彙'), '記事明細に外字を含む語を出さない');
     match.querySelector('button').click();
     assert(clipboard === match.querySelector('pre').textContent, '記事コピーと画面の一致');
-    action('未知語をコピー', match).click();
+    action(pastWords, match).click();
     assert(clipboard === '構築\n構成', '記事の単語コピーから外字を含む語を除く');
-    action('未知語をコピー(外字含む)', match).click();
+    action(pastWithOutside, match).click();
     assert(clipboard === '構築\n語彙\n構成', '外字を含む語も記事内の順序でコピー');
     const periodCharacters = panel.querySelector('.history-characters');
     const articleCharacters = match.querySelector('.history-characters');
@@ -287,12 +299,31 @@
     assert(!periodCharacters.querySelector('li[data-char="彙"]'), '外字は登録候補に出さない');
     const priorReport = report();
     const priorArticle = match.querySelector('pre').textContent;
+    for (const root of [panel, match]) {
+      assert(action(currentWords, root).disabled, '習得済みになった語だけなら通常の現在コピーは無効');
+      assertCopy(root, currentWithOutside, '語彙');
+    }
+    await otherTab.openMenu('学習設定を開く');
+    otherTab.forgetCharacter('築');
+    await until(() => !action(currentWords).disabled && !action(currentWords, match).disabled);
+    otherTab.closePanelForTest();
+    assertCopy(panel, currentWords, '構築');
+    assertCopy(match, currentWords, '構築');
+    assertCopy(panel, currentWithOutside, '語彙\n構築');
+    assertCopy(match, currentWithOutside, '構築\n語彙');
+    await GM.setValues({ 'known:築': true, learnedRevision: 'restore-tsuku' });
     for (const group of [periodCharacters, articleCharacters]) {
       await GM.setValues({ 'known:構': 'forgotten', learnedRevision: Math.random() });
       assert(!characterRow(periodCharacters).hidden && !characterRow(articleCharacters).hidden, '忘れた字は両方の候補に出す');
+      for (const root of [panel, match]) assertCopy(root, currentWords, '構築\n構成');
       characterRow(group).querySelector('button').click();
       await until(() => store.get('known:構') === true && characterRow(periodCharacters).hidden && characterRow(articleCharacters).hidden);
       await pause(0);
+      for (const root of [panel, match]) {
+        assert(action(currentWords, root).disabled, '習得登録した直後に現在の候補が空になる');
+        assertCopy(root, currentWithOutside, '語彙');
+        assertCopy(root, pastWords, '構築\n構成');
+      }
     }
     assert(periodCharacters.open && articleCharacters.open && report() === priorReport &&
       match.querySelector('pre').textContent === priorArticle, '習得登録後も展開状態と閲覧時の記録を保持');
@@ -301,10 +332,10 @@
     const outsideOnly = panel.querySelector('article');
     assert(report().endsWith('未知語\nなし') && outsideOnly.querySelector('pre').textContent.endsWith('未知語\nなし'),
       '外字を含む語だけの期間と記事は未知語なしと表示');
-    assert(action('未知語をコピー').disabled && action('未知語をコピー', outsideOnly).disabled, '外字を含む語だけなら通常の単語コピーは無効');
-    click('未知語をコピー(外字含む)'); assert(clipboard === '語彙', '削除後は残った記事から集計');
+    assert(action(pastWords).disabled && action(pastWords, outsideOnly).disabled, '外字を含む語だけなら通常の単語コピーは無効');
+    click(pastWithOutside); assert(clipboard === '語彙', '削除後は残った記事から集計');
     outsideOnly.querySelector('details').open = true;
-    action('未知語をコピー(外字含む)', outsideOnly).click();
+    action(pastWithOutside, outsideOnly).click();
     assert(clipboard === '語彙', '外字を含む語だけの記事でもコピー可能');
     closePanelForTest();
     article.textContent = '設計';
@@ -317,10 +348,11 @@
     mainToday.querySelector('details').open = true;
     action('この記事の記録を削除', mainToday).click(); click('削除する');
     await until(() => articleCount() === 1 && report().endsWith('未知語\nなし'));
-    assert(action('未知語をコピー').disabled && !action('この期間の記録をコピー').disabled, '未知語ゼロでも指標をコピー可能');
-    assert(action('未知語をコピー', panel.querySelector('article')).disabled, '未知語ゼロの記事では単語コピー不可');
-    assert(action('未知語をコピー(外字含む)').disabled &&
-      action('未知語をコピー(外字含む)', panel.querySelector('article')).disabled, '未知語ゼロでは外字込みのコピーも不可');
+    assert(action(pastWords).disabled && !action('この期間の記録をコピー').disabled, '未知語ゼロでも指標をコピー可能');
+    assert(action(pastWords, panel.querySelector('article')).disabled, '未知語ゼロの記事では単語コピー不可');
+    for (const label of [pastWithOutside, currentWords, currentWithOutside]) {
+      assert(action(label).disabled && action(label, panel.querySelector('article')).disabled, '未知語ゼロなら無効：' + label);
+    }
     click('この期間の記録をコピー'); assert(clipboard === report(), '未知語ゼロの期間コピー');
     await pause(0);
     const setClipboard = GM.setClipboard;
@@ -329,11 +361,12 @@
     click('この期間の記録をコピー');
     setPeriod(today, first.day);
     finishCopy(); await pause(0); GM.setClipboard = setClipboard;
-    assert(action('未知語をコピー').disabled && action('この期間の記録をコピー').disabled &&
+    assert([pastWords, pastWithOutside, currentWords, currentWithOutside, 'この期間の記録をコピー'].every(label => action(label).disabled) &&
       panel.textContent.includes('終了日は開始日以降'), '前のコピーが完了しても無効な期間の案内とボタン状態を維持');
     setPeriod('', '2000-01-01');
     await until(() => panel.textContent.includes('この期間の記録はありません。'));
-    assert(action('未知語をコピー').disabled && action('この期間の記録をコピー').disabled, '履歴ゼロではコピー不可');
+    assert([pastWords, pastWithOutside, currentWords, currentWithOutside, 'この期間の記録をコピー'].every(label => action(label).disabled),
+      '履歴ゼロではコピー不可');
     click('全件を削除'); click('キャンセル');
     await pause(0);
     assert(records().length === 2, '削除のキャンセル');

@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { snapshot, recordText, summarizePeriod, rankMissingCharacters, parseHosts, permits, historyStore, localDay } = require('../tut-code-meter.user.js');
+const { snapshot, recordText, summarizePeriod, practiceText, currentUnknownWords, rankMissingCharacters, parseHosts, permits, historyStore, localDay } = require('../tut-code-meter.user.js');
 
 const article = '設計、設計、設計、設計、設計、構築、構築、構成、語彙、語彙';
 const states = Object.fromEntries([...'設計築成語'].map(c => ['known:' + c, true]));
@@ -56,6 +56,26 @@ test('未知語の同数は新しい記録の初出順とし、対象字ゼロ�
   assert.ok(known.text.startsWith('期間　2025-03-01 以降\n'));
   assert.ok(known.text.endsWith('未知語\nなし'));
   assert.equal(known.wordText, '');
+});
+
+test('閲覧時の未知語を語全体の現在の習得状態で絞り、記事と期間それぞれの順序を保つ', () => {
+  const older = record(day1);
+  const newer = snapshot('語彙、構成、構成', states, page, day2);
+  const period = summarizePeriod([newer, older], '', '');
+  const now = { ...states, 'known:構': true, 'known:築': 'forgotten', 'known:設': false };
+
+  assert.equal(practiceText(currentUnknownWords(older.words, now), true), '構築\n語彙');
+  assert.equal(practiceText(currentUnknownWords(period.words, now), true), '語彙\n構築');
+  assert.equal(practiceText(currentUnknownWords(period.words, now), false), '構築');
+  assert.equal(period.tutWordText, '構成\n構築');
+  assert.equal(practiceText(older.words, false), '構築\n構成');
+});
+
+test('送り仮名を含む語は、表記中の漢字をすべて習得すると現在の候補から外れる', () => {
+  const saved = snapshot('取り込む', {}, page, day1);
+  const partial = { 'known:取': true };
+  assert.equal(practiceText(currentUnknownWords(saved.words, partial), false), '取り込む');
+  assert.deepEqual(currentUnknownWords(saved.words, { ...partial, 'known:込': true }), []);
 });
 
 test('記録モードは明示的に選択し、正規化したホスト名だけを照合する', () => {

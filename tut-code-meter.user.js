@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         tut-code-meter
 // @namespace    https://github.com/sakabar/tut-code-meter
-// @version      2.2.7
+// @version      2.3.0
 // @description  許可したページのTUT-Codeカバー率と未知語を端末内に記録し、あとから振り返ります。
 // @license      MIT AND BSD-3-Clause
 // @match        https://*/*
@@ -189,6 +189,15 @@ SUCH DAMAGE.
     return words.filter(item => includeOutside || !item.outside).map(item => item.word).join('\n');
   }
 
+  function practiceTexts(words) {
+    return { wordText: practiceText(words, true), tutWordText: practiceText(words, false) };
+  }
+
+  function currentUnknownWords(words, states) {
+    return words.filter(({ word, outside }) => outside ||
+      [...word].some(char => target.has(char) && states['known:' + char] !== true));
+  }
+
   function isMeeting(url) {
     return url.origin === 'https://meet.google.com' && /^\/[a-z]{3}-[a-z]{4}-[a-z]{3}\/?$/.test(url.pathname);
   }
@@ -261,7 +270,7 @@ SUCH DAMAGE.
       ...totals.map(metricLine), '未知語',
       ...(tutWords.length ? tutWords.map(({ word, count }) => word + '　' + count + '回') : ['なし']),
     ].join('\n');
-    return { text, wordText: practiceText(words, true), tutWordText: practiceText(words, false) };
+    return { text, words, ...practiceTexts(words) };
   }
 
   function recordText(record) {
@@ -388,7 +397,7 @@ SUCH DAMAGE.
   }
 
   if (typeof document === 'undefined') {
-    module.exports = { target, parseLearned, classifyForgetInput, analyze, percentage, practiceText, isMeeting,
+    module.exports = { target, parseLearned, classifyForgetInput, analyze, percentage, practiceText, currentUnknownWords, isMeeting,
       snapshot, recordText, summarizePeriod, rankMissingCharacters, parseHosts, permits, historyStore, localDay };
     return;
   }
@@ -554,7 +563,7 @@ SUCH DAMAGE.
   const readHighlightSetting = () => GM_getValues(['decorate']).decorate !== false;
   let highlightEnabled = readHighlightSetting();
   let host, dialog;
-  let refreshSettings, refreshHistory, refreshHistoryCharacters;
+  let refreshSettings, refreshHistory, refreshHistoryLearning;
   function el(tag, text) {
     const node = document.createElement(tag);
     if (text !== undefined) node.textContent = text;
@@ -581,7 +590,7 @@ SUCH DAMAGE.
   function closePanel(resume = true) {
     if (dialog?.open) dialog.close();
     host?.remove();
-    host = dialog = refreshSettings = refreshHistory = refreshHistoryCharacters = null;
+    host = dialog = refreshSettings = refreshHistory = refreshHistoryLearning = null;
     if (resume) updateActivity();
   }
 
@@ -795,7 +804,7 @@ SUCH DAMAGE.
           const neighbor = visible[index + 1] || visible[index - 1];
           const top = row.getBoundingClientRect().top;
           await GM.setValues({ ['known:' + char]: true, learnedRevision: nonce() });
-          refreshHistoryCharacters?.();
+          refreshHistoryLearning?.();
           if (dialog === panel && neighbor?.isConnected && !neighbor.hidden && group.open) {
             panel.scrollTop += neighbor.getBoundingClientRect().top - top;
           }
@@ -806,8 +815,12 @@ SUCH DAMAGE.
       }
       return group;
     }
-    refreshHistoryCharacters = () => {
+    const currentWordGroups = new Map();
+    refreshHistoryLearning = () => {
       const states = GM_getValues(profileKeys);
+      for (const [controls, words] of currentWordGroups) {
+        controls.update(practiceTexts(currentUnknownWords(words, states)));
+      }
       for (const group of results.querySelectorAll('.history-characters')) {
         let remaining = 0;
         for (const row of group.querySelectorAll('li')) {
@@ -819,12 +832,20 @@ SUCH DAMAGE.
       }
     };
     const copyRange = button('この期間の記録をコピー', () => copy(report.text), status, () => Boolean(report));
-    function wordCopyButton(getText, includeOutside) {
-      const label = includeOutside ? '未知語をコピー(外字含む)' : '未知語をコピー';
-      return button(label, () => copy(getText()), status, () => Boolean(getText()));
+    function wordCopyButtons(label, texts = {}) {
+      const regular = button(label, () => copy(texts.tutWordText), status, () => Boolean(texts.tutWordText));
+      const withOutside = button(label + '(外字含む)', () => copy(texts.wordText), status, () => Boolean(texts.wordText));
+      return {
+        buttons: [regular, withOutside],
+        update(next = {}) {
+          texts = next;
+          regular.disabled = !texts.tutWordText;
+          withOutside.disabled = !texts.wordText;
+        },
+      };
     }
-    const copyWords = wordCopyButton(() => report?.tutWordText, false);
-    const copyWordsWithOutside = wordCopyButton(() => report?.wordText, true);
+    const pastLabel = '当時の未知語をコピー', currentLabel = '今も未知の語をコピー';
+    const periodPast = wordCopyButtons(pastLabel), periodCurrent = wordCopyButtons(currentLabel);
     function confirmDelete(scope, message) {
       confirmation.replaceChildren(el('p', message), button('削除する', async () => {
         await history.remove(scope);
@@ -837,14 +858,17 @@ SUCH DAMAGE.
     const removeAll = button('全件を削除', () => confirmDelete({}, '指定期間の外も含め、すべての学習履歴を削除しますか？'));
     const actions = el('div');
     actions.className = 'actions';
-    actions.append(copyRange, copyWords, copyWordsWithOutside, removeAll);
+    actions.append(copyRange, ...periodPast.buttons, ...periodCurrent.buttons, removeAll);
     section.append(filters, actions, confirmation, status, results);
 
     async function load() {
       const request = ++revision;
       const from = start.value, to = end.value;
       confirmation.replaceChildren();
-      copyRange.disabled = copyWords.disabled = copyWordsWithOutside.disabled = true;
+      copyRange.disabled = true;
+      currentWordGroups.clear();
+      periodPast.update();
+      periodCurrent.update();
       report = undefined;
       results.replaceChildren();
       if (from && to && from > to) {
@@ -860,8 +884,8 @@ SUCH DAMAGE.
         }
         report = summarizePeriod(found, from, to);
         copyRange.disabled = false;
-        copyWords.disabled = !report.tutWordText;
-        copyWordsWithOutside.disabled = !report.wordText;
+        periodPast.update(report);
+        currentWordGroups.set(periodCurrent, report.words);
         const summaryText = el('pre', report.text);
         summaryText.className = 'period-summary';
         results.append(el('h2', '期間集計'), summaryText, learningList(found), el('h2', '記事別の記録'));
@@ -871,16 +895,18 @@ SUCH DAMAGE.
           const summary = el('summary', record.day + ' ' + record.time + '　' + record.title);
           const tools = el('div');
           tools.className = 'actions';
+          const past = wordCopyButtons(pastLabel, practiceTexts(record.words));
+          const current = wordCopyButtons(currentLabel);
+          currentWordGroups.set(current, record.words);
           tools.append(button('この記事の記録をコピー', () => copy(recordText(record)), status),
-            wordCopyButton(() => practiceText(record.words, false), false),
-            wordCopyButton(() => practiceText(record.words, true), true),
+            ...past.buttons, ...current.buttons,
             button('この記事の記録を削除', () => confirmDelete({ day: record.day, url: record.url }, 'この記事の' + record.day + 'の記録を削除しますか？')),
             button('このサイトの記録を削除', () => confirmDelete({ host: record.host }, record.host + ' の全期間の記録を削除しますか？')));
           detail.append(summary, tools, learningList([record]), el('pre', recordText(record)));
           article.append(detail);
           results.append(article);
         }
-        refreshHistoryCharacters();
+        refreshHistoryLearning();
       } catch { if (revision === request) status.textContent = '履歴を読み込めませんでした。'; }
     }
     start.oninput = end.oninput = load;
@@ -1076,7 +1102,7 @@ SUCH DAMAGE.
     highlightStates = undefined;
     scheduleHighlights();
     refreshSettings?.();
-    refreshHistoryCharacters?.();
+    refreshHistoryLearning?.();
   });
   document.addEventListener('scroll', scheduleHighlights, true);
   document.addEventListener('selectionchange', scheduleHighlights);
